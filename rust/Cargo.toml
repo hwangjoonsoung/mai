@@ -1,0 +1,39 @@
+[package]
+name = "multi_ai_cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Claude / Codex / Gemini(agy) 를 한 화면에서 다루는 에이전트 멀티플렉서"
+license = "MIT"
+
+[dependencies]
+# PTY — 에이전트를 대화형 그대로 띄운다. Windows 는 ConPTY 경로를 쓴다.
+portable-pty = "0.9"
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+# VT 에뮬레이션 — 에이전트가 뱉는 ANSI 를 화면 버퍼로 유지한다.
+# REBUILD.md §7.1 의 최대 위험 요소. R1 에서 기성품으로 되는지 판정한다.
+vt100 = { path = "vendor/vt100", version = "=0.16.2" }
+
+# 오류 처리
+# 한글은 두 칸을 차지한다. 커서 위치 계산에 필요하다.
+unicode-width = "0.2.1"
+
+# 신뢰 설정(~/.claude.json) 편집과 향후 구조화 출력 파싱
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 서브에이전트(자식 프로세스) 트리 조회. 초당 1회만 갱신한다.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
+anyhow = "1"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

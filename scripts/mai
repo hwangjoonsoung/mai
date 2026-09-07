@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# multi_ai_cli 단일 진입점. 빌드가 필요하면 빌드하고 바로 띄운다.
+#
+#   mai              지금 있는 디렉터리를 공간으로 실행
+#   mai ~/proj       그 디렉터리를 공간으로 실행
+#   mai --which      참여자를 어떻게 띄우는지 확인
+#   mai --doctor     설치·인증·툴체인 점검
+#   mai --rebuild    강제로 다시 빌드하고 실행
+#
+# **cwd 를 바꾸지 않는다.** 앱은 자기 작업 디렉터리를 첫 공간으로 잡으므로,
+# 어디서 쳤는지가 곧 어느 프로젝트인지다. 빌드만 서브셸에서 저장소로 들어간다.
+set -euo pipefail
+
+# 심링크로 걸려 있어도 실제 스크립트 위치를 찾는다. macOS 의 readlink 에는
+# -f 가 없는 판이 있어 직접 따라간다.
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+done
+root="$(cd -P "$(dirname "$src")/.." && pwd)"
+
+if ! command -v cargo >/dev/null 2>&1 && [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+fi
+
+rebuild=0
+args=()
+workspace=""
+
+# **첫 인자가 플래그면 전부 그대로 넘긴다.**
+#
+# 예전엔 «옵션이 아닌 첫 인자» 를 공간 경로로 봤다. 그러면 인자를 받는
+# 하위 명령이 깨진다 — `mai --quote claude` 의 claude 가 경로로 잡혀
+# `cd claude` 로 죽었다. 경로를 주는 것은 첫 자리뿐이라는 규칙이 더 단순하다.
+if [[ $# -gt 0 && "$1" != -* ]]; then
+    workspace="$1"
+    shift
+fi
+
+for a in "$@"; do
+    case "$a" in
+        --rebuild) rebuild=1 ;;
+        --doctor)  exec bash "$root/scripts/doctor.sh" ;;
+        *) args+=("$a") ;;
+    esac
+done
+
+bin="$root/rust/target/release/multi_ai_cli"
+[[ -x "$root/rust/target/debug/multi_ai_cli" && ! -x "$bin" ]] && bin="$root/rust/target/debug/multi_ai_cli"
+
+# 소스가 바이너리보다 새로우면 다시 빌드한다. cargo 가 판정하게 두면 매번
+# 몇백 ms 를 쓰므로, 우리가 먼저 걸러 낸다.
+stale=0
+if [[ ! -x "$bin" ]]; then
+    stale=1
+else
+    while IFS= read -r f; do
+        [[ "$f" -nt "$bin" ]] && { stale=1; break; }
+    done < <(find "$root/rust/src" -name '*.rs'; echo "$root/rust/Cargo.toml")
+fi
+
+if (( rebuild || stale )); then
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "cargo 가 없다. Rust 툴체인을 먼저 깐다:" >&2
+        echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+        exit 1
+    fi
+    echo "빌드 중…" >&2
+    # 실패했을 때만 전문을 보여준다. 성공 시 경고까지 쏟으면 시작이 시끄럽다.
+    log="$(mktemp)"
+    if ! (cd "$root/rust" && cargo build --release) >"$log" 2>&1; then
+        cat "$log" >&2
+        rm -f "$log"
+        exit 1
+    fi
+    rm -f "$log"
+    bin="$root/rust/target/release/multi_ai_cli"
+fi
+
+export LANG="${LANG:-en_US.UTF-8}"
+export LC_ALL="${LC_ALL:-$LANG}"
+
+[[ -n "$workspace" ]] && cd "$workspace"
+exec "$bin" "${args[@]+"${args[@]}"}"

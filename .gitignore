@@ -1,0 +1,11 @@
+# 빌드 산출물
+out/
+build/
+bin/
+*.class
+
+# 로컬 실행 산출물
+*.log
+
+# Rust 빌드 산출물
+rust/target/
