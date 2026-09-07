@@ -71,7 +71,7 @@ fn main() -> Result<()> {
         Some("--probe") => return probe(),
         Some("--complete") => {
             // 경로 탭 완성을 화면 없이 확인한다. `~` 확장도 여기서 드러난다.
-            let mut app = App::new(AGENTS);
+            let mut app = App::new();
             for raw in args.iter().skip(1) {
                 app.input = raw.clone();
                 app.status.clear();
@@ -257,7 +257,7 @@ where
 // ---------- R2 본 흐름 ----------
 
 fn run(term: &mut Term) -> Result<()> {
-    let mut app = App::new(AGENTS);
+    let mut app = App::new();
 
     // 질문을 먼저 묻지 않는다. 크기를 알자마자 참여자를 띄우고 패널로 들어간다.
     // 크기가 필요해서 App::new 가 아니라 여기서 한다.
@@ -286,7 +286,6 @@ fn run(term: &mut Term) -> Result<()> {
                 }
                 match app.mode {
                     Mode::Panes => on_key_panes(&mut app, k)?,
-                    Mode::Picker => on_key_picker(&mut app, k, term)?,
                     Mode::NewSpace => on_key_new_space(&mut app, k)?,
                     Mode::Broadcast => on_key_broadcast(&mut app, k)?,
                     Mode::Relay => on_key_relay(&mut app, k)?,
@@ -303,21 +302,6 @@ fn run(term: &mut Term) -> Result<()> {
             _ => {}
         }
     }
-}
-
-/// `+` 선택 상자 — 어떤 에이전트를 띄울지 고른다.
-fn on_key_picker(app: &mut App, k: KeyEvent, term: &mut Term) -> Result<()> {
-    match k.code {
-        KeyCode::Esc => app.mode = Mode::Panes,
-        KeyCode::Char(c @ '1'..='9') => {
-            let i = c as usize - '1' as usize;
-            let a = term.size()?;
-            app.mode = Mode::Panes;
-            app.pick(i, ratatui::layout::Rect::new(0, 0, a.width, a.height));
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// 새 공간 경로 입력.
@@ -455,13 +439,11 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
             KeyCode::Left => app.cycle_focus(-1),
             KeyCode::Right => app.cycle_focus(1),
             KeyCode::Char('q') => app.quit = true,
-            // t 터미널 추가 — [+] 클릭과 같다.
+            // t 칸 추가 — [+] 클릭과 같다.
             KeyCode::Char('t') => {
                 let a = app.last_area();
                 app.spawn_terminal(a);
             }
-            // p 에이전트 선택 상자. 닫은 참여자를 되살릴 때 쓴다.
-            KeyCode::Char('p') => app.mode = Mode::Picker,
             // f 이 칸의 마지막 답변을 나머지 칸으로 넘긴다.
             KeyCode::Char('f') => app.prepare_relay(),
             // 기존 프리픽스 a 조작도 호환한다. Ctrl+A 직접 입력도 전달된다.
@@ -588,26 +570,34 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
         MouseEventKind::Down(MouseButton::Left) => {}
         _ => return,
     }
-    match app.hit_test(m.column, m.row) {
-        Some(Hit::Close(i)) => app.close_session(i),
-        Some(Hit::ShowAll) => app.show_all = true,
+    if let Some(hit) = app.hit_test(m.column, m.row) {
+        on_hit(app, hit);
+    }
+}
+
+/// 클릭이 가리킨 것을 실행한다.
+fn on_hit(app: &mut App, hit: Hit) {
+    match hit {
+        Hit::Close(i) => app.close_session(i),
+        Hit::ShowAll => app.show_all = true,
         // 탭 칩 — 한 번이면 포커스, 짧은 사이에 두 번이면 이름 고치기.
-        Some(Hit::Tab(i)) => app.tab_click(i),
-        Some(Hit::Focus(i)) => {
-            // 특정 에이전트를 고르면 전체 보기에서 빠져나온다.
+        Hit::Tab(i) => app.tab_click(i),
+        Hit::Focus(i) => {
+            // 특정 칸을 고르면 전체 보기에서 빠져나온다.
             app.show_all = false;
             app.focus = i;
         }
-        Some(Hit::Space(i)) => app.select_space(i),
-        Some(Hit::AddSpace) => {
+        Hit::Space(i) => app.select_space(i),
+        Hit::AddSpace => {
             app.input = app.active_path().to_string_lossy().into_owned();
             app.mode = Mode::NewSpace;
         }
-        // [+] 는 무엇을 띄울지 묻는다. 기동 때 아무것도 자동으로 뜨지 않으므로
-        // 에이전트를 붙이는 길이 여기에 있어야 한다. 터미널만 빠르게 붙이려면
-        // Ctrl+] t 가 상자를 건너뛴다.
-        Some(Hit::AddSession) => app.mode = Mode::Picker,
-        None => {}
+        // [+] 는 묻지 않고 칸을 하나 더 붙인다. 무엇을 띄울지 고르던 상자는
+        // 없앴다 — 에이전트도 그 칸에서 `claude` 를 치면 뜬다. Ctrl+] t 와 같다.
+        Hit::AddSession => {
+            let a = app.last_area();
+            app.spawn_terminal(a);
+        }
     }
 }
 
@@ -698,7 +688,7 @@ fn on_paste(app: &mut App, text: &str) -> Result<()> {
             if let Err(e) = p.write(&bytes) { app.status = format!("붙여넣기 실패: {e}"); }
         }
         if let Some(s) = app.sessions.get_mut(focus) { s.user_typed = true; }
-    } else if !matches!(app.mode, Mode::Picker) {
+    } else {
         app.input.push_str(text);
     }
     Ok(())
@@ -1036,7 +1026,7 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        App::new(&[("claude", "Claude"), ("codex", "Codex")])
+        App::new()
     }
     fn key(c: KeyCode, m: KeyModifiers) -> KeyEvent {
         KeyEvent::new(c, m)
@@ -1076,13 +1066,15 @@ mod tests {
         assert!(matches!(a.mode, Mode::Panes), "선택 상자로 새면 안 된다");
     }
 
-    /// 닫은 참여자를 되살리는 길은 남아 있어야 한다.
+    /// `[+]` 클릭도 상자를 거치지 않고 바로 칸을 붙인다.
     #[test]
-    fn 프리픽스_p_는_에이전트_선택_상자다() {
+    fn 더하기_클릭은_칸을_바로_붙인다() {
         let mut a = app();
-        on_key_panes(&mut a, key(KeyCode::Char('5'), KeyModifiers::CONTROL)).unwrap();
-        on_key_panes(&mut a, key(KeyCode::Char('p'), KeyModifiers::empty())).unwrap();
-        assert!(matches!(a.mode, Mode::Picker));
+        let before = a.sessions.len();
+        on_hit(&mut a, Hit::AddSession);
+        assert_eq!(a.sessions.len(), before + 1, "[+] 로 칸이 안 생겼다");
+        assert!(a.sessions.last().expect("방금 붙인 칸").is_terminal);
+        assert!(matches!(a.mode, Mode::Panes), "선택 상자로 새면 안 된다");
     }
 
     #[test]
@@ -1149,14 +1141,16 @@ mod tests {
         assert_eq!(a.sessions[0].title, "zsh");
     }
 
-    /// `[+]` 상자의 0번은 터미널이고 그다음이 에이전트다.
+    /// 새 칸의 이름은 그 OS 의 셸이다 — 윈도우 powershell, 그 밖은 zsh 등.
     #[test]
-    fn 선택_상자는_터미널을_앞세운다() {
-        let a = app();
-        let items = a.picker_items();
-        assert!(items[0].starts_with("터미널"), "{items:?}");
-        assert_eq!(items.len(), a.agents.len() + 1);
-        assert_eq!(items[1], "Claude");
+    fn 새_칸의_이름은_셸_이름이다() {
+        let mut a = app();
+        on_hit(&mut a, Hit::AddSession);
+        let s = a.sessions.last().expect("방금 붙인 칸");
+        assert_eq!(s.title, pty::shell_name(), "칸 이름이 셸 이름이 아니다");
+        if cfg!(windows) {
+            assert!(s.title.contains("powershell") || s.title.contains("pwsh") || s.title.contains("cmd"), "{}", s.title);
+        }
     }
 
     /// Enter 는 전송, Shift/Alt+Enter 는 줄바꿈(ESC CR)이다.

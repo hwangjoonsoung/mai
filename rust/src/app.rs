@@ -1,15 +1,15 @@
 //! 앱 상태와 화면. 「공간 × 세션」 구조다.
 //!
 //! 화면 모드
-//!   Panes    — 기본 화면. 선택된 공간의 세션들. 그 안은 에이전트의 실제 TUI 다.
-//!   Picker   — `+` 를 눌러 어떤 에이전트를 띄울지 고르는 중
+//!   Panes    — 기본 화면. 선택된 공간의 세션들. 그 안은 자식의 실제 TUI 다.
 //!   NewSpace — 새 공간의 경로를 입력하는 중
 //!   Broadcast— 보이는 모든 에이전트에게 한 번에 묻는 중
 //!
 //! **시작하자마자 Panes 다.** 예전엔 질문을 먼저 받는 Idle 화면을 거쳤는데,
 //! 그 화면은 에이전트를 띄우기 위한 관문일 뿐이라 한 번 쓰고 다시 볼 일이
-//! 없었다. 지금은 기동과 동시에 쓸 수 있는 참여자를 전부 띄우고, 각 칸에는
-//! 에이전트 자신의 첫 화면이 그대로 보인다. 질문은 Ctrl+] 다음 n 으로 언제든 넣는다.
+//! 없었다. 지금은 기동과 동시에 셸 칸 하나가 뜨고, `[+]` 는 묻지 않고 칸을
+//! 하나 더 붙인다. 에이전트는 그 칸에서 `claude`·`codex` 처럼 직접 친다.
+//! 질문은 Ctrl+] 다음 n 으로 언제든 넣는다.
 //!
 //! 키는 기본적으로 **포커스된 세션의 자식에게 그대로** 간다. 그래야 권한 승인·
 //! 슬래시 자동완성·esc 중단이 동작한다. 우리 조작은 tmux 처럼 프리픽스로 뺀다.
@@ -40,7 +40,6 @@ pub const MAX_SPLIT: usize = 3;
 
 pub enum Mode {
     Panes,
-    Picker,
     NewSpace,
     /// 보이는 모든 에이전트에게 한 번에 묻는 중
     Broadcast,
@@ -60,7 +59,7 @@ pub enum Hit {
     Space(usize),
     /// 새 공간 추가
     AddSpace,
-    /// 새 세션 추가 (+)
+    /// 새 칸 추가 (+). 묻지 않고 셸 칸을 하나 붙인다.
     AddSession,
     /// 전체 보기 탭
     ShowAll,
@@ -69,9 +68,6 @@ pub enum Hit {
 }
 
 pub struct App {
-    /// 띄울 수 있는 에이전트 (id, 표시명)
-    pub agents: Vec<(String, String)>,
-
     pub spaces: Vec<Space>,
     pub active_space: usize,
     pub sessions: Vec<Session>,
@@ -127,10 +123,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(agents: &[(&str, &str)]) -> Self {
+    pub fn new() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
-            agents: agents.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
             spaces: vec![Space::new(cwd)],
             active_space: 0,
             sessions: Vec::new(),
@@ -214,25 +209,6 @@ impl App {
         self.status = HINT.into();
     }
 
-    /// `[+]` 상자에 늘어놓을 것들. 0번이 터미널, 그다음이 에이전트다.
-    pub fn picker_items(&self) -> Vec<String> {
-        let mut v = vec![format!("터미널 ({})", crate::pty::shell_name())];
-        v.extend(self.agents.iter().map(|(_, t)| t.clone()));
-        v
-    }
-
-    /// `[+]` 상자에서 n 번째를 고른다.
-    pub fn pick(&mut self, n: usize, area: Rect) {
-        if n == 0 {
-            self.spawn_terminal(area);
-            return;
-        }
-        if let Some((id, _)) = self.agents.get(n - 1).cloned() {
-            self.mode = Mode::Panes;
-            self.spawn_session(&id, area, None);
-        }
-    }
-
     // ---------- 공간 ----------
 
     pub fn add_space(&mut self, path: &str) -> Result<(), String> {
@@ -270,40 +246,13 @@ impl App {
 
     // ---------- 세션 ----------
 
-    /// 지금 공간에서 에이전트 하나를 띄운다.
-    pub fn spawn_session(&mut self, agent_id: &str, area: Rect, prompt: Option<&str>) {
-        let title = self
-            .agents
-            .iter()
-            .find(|(id, _)| id == agent_id)
-            .map(|(_, t)| t.clone())
-            .unwrap_or_else(|| agent_id.to_string());
-
-        let n = (self.visible().len() + 1).min(MAX_SPLIT);
-        let (h, w) = pane_size(area, n);
-        let cwd = self.active_path();
-
-        let mut s = Session::new(agent_id, &title, self.active_space);
-        match PtySession::spawn_in(agent_id, h, w, &cwd) {
-            Ok(pty) => {
-                s.pty = Some(pty);
-                s.size = (h, w);
-                s.pending = prompt.map(String::from);
-                s.started = Some(Instant::now());
-                s.seen = (0, Instant::now());
-                self.sessions.push(s);
-                self.focus = self.sessions.len() - 1;
-                self.mode = Mode::Panes;
-            }
-            Err(e) => self.status = format!("{title} 기동 실패 — {e}"),
-        }
-    }
-
     /// 지금 공간에 **터미널** 칸을 하나 붙인다.
     ///
-    /// `[+]` 가 하는 일이다. 예전엔 여기서 에이전트를 골랐지만, 에이전트는 이미
-    /// 기동 때 다 떠 있다. 그 자리에서 실제로 아쉬운 건 «같은 경로에서 명령을
-    /// 쳐 볼 셸» 이라 그걸 기본으로 삼는다. 에이전트를 되살리려면 Ctrl+] p.
+    /// `[+]` 가 하는 일이다. 예전엔 여기서 무엇을 띄울지(터미널/Claude/Codex/
+    /// Gemini) 골랐다. 그런데 고를 것이 실은 하나뿐이었다 — 에이전트도 결국
+    /// 셸에서 `claude` 를 치면 뜨고, 그 편이 인자·프로필을 그대로 쓸 수 있어
+    /// 낫다. 그래서 상자를 없애고 **누르면 칸이 하나 더 생기는** 것으로 바꿨다.
+    /// 셸은 환경이 정한다 — 윈도우는 PowerShell, 그 밖에서는 `$SHELL`(보통 zsh).
     pub fn spawn_terminal(&mut self, area: Rect) {
         let n = (self.visible().len() + 1).min(MAX_SPLIT);
         let (h, w) = pane_size(area, n);
@@ -763,10 +712,6 @@ impl App {
     pub fn draw(&mut self, f: &mut Frame) {
         match self.mode {
             Mode::Panes => self.draw_panes(f),
-            Mode::Picker => {
-                self.draw_panes(f);
-                self.draw_picker(f);
-            }
             Mode::NewSpace => {
                 self.draw_panes(f);
                 self.draw_new_space(f);
@@ -901,7 +846,7 @@ impl App {
         let vis = self.visible();
         if vis.is_empty() {
             f.render_widget(
-                Paragraph::new("이 공간에 세션이 없다. [+] 터미널 · Ctrl+] 다음 p 에이전트.")
+                Paragraph::new("이 공간에 세션이 없다. [+] 또는 Ctrl+] 다음 t 로 칸을 붙인다.")
                     .style(Style::default().fg(Color::DarkGray)),
                 area,
             );
@@ -959,33 +904,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// `+` 를 눌렀을 때의 에이전트 선택 상자.
-    fn draw_picker(&self, f: &mut Frame) {
-        let area = f.area();
-        let h = self.picker_items().len() as u16 + 2;
-        let r = center(area, 40, h);
-        f.render_widget(Clear, r);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Green))
-            .title(" 무엇을 띄울까 (숫자 선택 · Esc 취소) ");
-        let inner = block.inner(r);
-        f.render_widget(block, r);
-        let lines: Vec<Line> = self
-            .picker_items()
-            .into_iter()
-            .enumerate()
-            .map(|(i, t)| {
-                Line::from(vec![
-                    Span::styled(format!(" {} ", i + 1), Style::default().fg(Color::Green)),
-                    Span::raw(t),
-                ])
-            })
-            .collect();
-        f.render_widget(Paragraph::new(lines), inner);
     }
 
     /// 인용 전달 상자 — 받을 칸을 고르고 한 문장을 적는다.
