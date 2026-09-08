@@ -291,6 +291,7 @@ fn run(term: &mut Term) -> Result<()> {
                     Mode::Broadcast => on_key_broadcast(&mut app, k)?,
                     Mode::Relay => on_key_relay(&mut app, k)?,
                     Mode::RenameTab => on_key_rename(&mut app, k)?,
+                    Mode::Menu => on_key_menu(&mut app, k)?,
                 }
             }
             Event::Paste(text) => on_paste(&mut app, &text)?,
@@ -398,6 +399,47 @@ fn on_key_rename(app: &mut App, k: KeyEvent) -> Result<()> {
 ///
 /// 인용문은 상자를 열 때 이미 꺼내 뒀다. 여기서 받는 건 «넌 어떻게 생각해?»
 /// 한 줄이고, 그게 인용문 뒤에 붙어 나머지 칸으로 간다.
+fn on_key_menu(app: &mut App, k: KeyEvent) -> Result<()> {
+    let len = app.menu_items().len();
+    match k.code {
+        KeyCode::Esc => app.cancel_menu(),
+        KeyCode::Up => app.menu_selected = app.menu_selected.saturating_sub(1),
+        KeyCode::Down => app.menu_selected = (app.menu_selected + 1).min(len.saturating_sub(1)),
+        KeyCode::Enter => {
+            let selected = app.menu_selected;
+            if let Some(i) = app.menu_pane {
+                match selected {
+                    0 => {
+                        app.toggle_zoom(i);
+                        app.cancel_menu();
+                    }
+                    1 => {
+                        app.focus = i;
+                        app.prepare_relay();
+                    }
+                    2 => app.begin_rename(i),
+                    3 => {
+                        app.close_session(i);
+                        app.cancel_menu();
+                    }
+                    _ => app.cancel_menu(),
+                }
+            } else {
+                match selected {
+                    0 => {
+                        app.input.clear();
+                        app.mode = Mode::Broadcast;
+                    }
+                    1 => app.quit = true,
+                    _ => app.cancel_menu(),
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn on_key_relay(app: &mut App, k: KeyEvent) -> Result<()> {
     match k.code {
         KeyCode::Esc => {
@@ -454,7 +496,12 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
             }
             KeyCode::Left => app.cycle_focus(-1),
             KeyCode::Right => app.cycle_focus(1),
+            KeyCode::Esc => {},
             KeyCode::Char('q') => app.quit = true,
+            KeyCode::Char('z') => {
+                let focus = app.focus;
+                app.toggle_zoom(focus);
+            }
             // t 터미널 추가 — [+] 클릭과 같다.
             KeyCode::Char('t') => {
                 let a = app.last_area();
@@ -471,9 +518,10 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
                 }
             }
             // 프리픽스를 한 번 더 누르면 프리픽스 자체를 자식에게 보낸다.
-            c if is_prefix_key(c) => {
+            c if app.is_prefix_key(c) => {
+                let byte = app.prefix_byte();
                 if let Some(s) = app.focused() {
-                    let _ = s.write(&[0x1d]);
+                    let _ = s.write(&[byte]);
                 }
             }
             _ => {}
@@ -483,7 +531,7 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
 
     if k.modifiers.contains(KeyModifiers::CONTROL) {
         match k.code {
-            c if is_prefix_key(c) => {
+            c if app.is_prefix_key(c) => {
                 app.prefix = true;
                 return Ok(());
             }
@@ -521,6 +569,25 @@ fn on_key_panes(app: &mut App, k: KeyEvent) -> Result<()> {
 /// 자식의 마우스 추적 모드에 따라 패널 좌표로 전달하거나 로컬 텍스트를 선택한다.
 fn on_mouse(app: &mut App, m: MouseEvent) {
     if !matches!(app.mode, Mode::Panes) { return; }
+    if app.resizing() {
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Down(MouseButton::Left) => {
+                app.drag_resize(m.column, m.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                app.drag_resize(m.column, m.row);
+                app.end_resize();
+            }
+            _ => {}
+        }
+        return;
+    }
+    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+        && app.begin_resize(m.column, m.row)
+    {
+        app.selection = None;
+        return;
+    }
     if let Some((i, area)) = app.mouse_capture {
         if matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
             let local = MouseEvent {
@@ -590,13 +657,27 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
     }
     match app.hit_test(m.column, m.row) {
         Some(Hit::Close(i)) => app.close_session(i),
-        Some(Hit::ShowAll) => app.show_all = true,
+        Some(Hit::ShowAll) => {
+            app.zoomed = None;
+            app.show_all = true;
+        }
         // 탭 칩 — 한 번이면 포커스, 짧은 사이에 두 번이면 이름 고치기.
         Some(Hit::Tab(i)) => app.tab_click(i),
         Some(Hit::Focus(i)) => {
             // 특정 에이전트를 고르면 전체 보기에서 빠져나온다.
             app.show_all = false;
+            app.zoomed = None;
             app.focus = i;
+        }
+        Some(Hit::TopAdd) => app.mode = Mode::Picker,
+        Some(Hit::TopMenu) => app.open_menu(None),
+        Some(Hit::Relay(i)) => {
+            app.focus = i;
+            app.prepare_relay();
+        }
+        Some(Hit::PaneMenu(i)) => {
+            app.focus = i;
+            app.open_menu(Some(i));
         }
         Some(Hit::Space(i)) => app.select_space(i),
         Some(Hit::AddSpace) => {
@@ -673,15 +754,6 @@ fn keylog(k: &KeyEvent) {
 ///
 /// 한쪽만 보던 탓에 macOS 에서는 프리픽스가 통째로 죽어 있었다 — Ctrl+] 다음의
 /// q(종료)·1..9(포커스)·a 가 전부 자식에게 흘러들어갔다(실측).
-fn is_prefix_key(c: KeyCode) -> bool {
-    match c {
-        KeyCode::Char(']') => true,
-        // 유닉스에서만 받는다. Windows 의 Char('5') 는 진짜 Ctrl+5 다.
-        KeyCode::Char('5') => !cfg!(windows),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 fn encode_key(k: &KeyEvent) -> Option<Vec<u8>> {
     terminal_input::key(k, false)
@@ -1061,6 +1133,80 @@ mod tests {
         on_key_panes(&mut a, key(KeyCode::Char('q'), KeyModifiers::empty())).unwrap();
         assert!(a.quit, "Ctrl+] 다음 q 가 종료로 이어지지 않았다");
         assert!(!a.prefix, "프리픽스가 한 번 쓰고 풀려야 한다");
+    }
+
+    #[test]
+    fn 설정한_프리픽스는_취소되고_단발_명령_뒤_자동_복귀한다() {
+        let mut a = app_with_tabs();
+        a.prefix_char = 'b';
+        on_key_panes(&mut a, key(KeyCode::Char('b'), KeyModifiers::CONTROL)).unwrap();
+        assert!(a.prefix);
+        on_key_panes(&mut a, key(KeyCode::Esc, KeyModifiers::empty())).unwrap();
+        assert!(!a.prefix);
+
+        on_key_panes(&mut a, key(KeyCode::Char('b'), KeyModifiers::CONTROL)).unwrap();
+        on_key_panes(&mut a, key(KeyCode::Right, KeyModifiers::empty())).unwrap();
+        assert!(!a.prefix);
+        assert_eq!(a.focus, 1);
+        assert!(matches!(a.mode, Mode::Panes));
+    }
+
+    #[test]
+    fn 메뉴의_확대와_복귀는_세션을_유지한다() {
+        let mut a = app_with_tabs();
+        let before = a.sessions.len();
+        a.open_menu(Some(1));
+        on_key_menu(&mut a, key(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        assert_eq!(a.zoomed, Some(1));
+        assert_eq!(a.sessions.len(), before);
+        assert!(matches!(a.mode, Mode::Panes));
+
+        a.open_menu(Some(1));
+        on_key_menu(&mut a, key(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        assert_eq!(a.zoomed, None);
+        assert_eq!(a.sessions.len(), before);
+    }
+
+    #[test]
+    fn 칸_제목_클릭과_상단_메뉴가_즉시_동작한다() {
+        let mut a = app_with_tabs();
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+
+        on_mouse(&mut a, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 75,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(a.focus, 1, "두 번째 칸 제목 클릭으로 포커스가 옮겨야 한다");
+
+        on_mouse(&mut a, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 116,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(a.mode, Mode::Menu));
+        assert_eq!(a.menu_pane, None);
+    }
+
+    #[test]
+    fn 화면_폭에_따라_분할과_탭을_자동_전환해도_세션은_유지된다() {
+        let mut a = app_with_tabs();
+        let before = a.sessions.len();
+
+        let backend = ratatui::backend::TestBackend::new(140, 24);
+        let mut wide = Terminal::new(backend).unwrap();
+        wide.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.pane_inner.len(), 2, "넓은 화면에서는 두 칸 비교");
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut narrow = Terminal::new(backend).unwrap();
+        narrow.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.pane_inner.len(), 1, "칸당 42열 미만이면 탭 표시");
+        assert_eq!(a.sessions.len(), before, "숨긴 세션을 제거하면 안 된다");
     }
 
     /// `[+]` 와 Ctrl+] t 는 터미널을 붙인다. 에이전트 선택 상자가 아니다.

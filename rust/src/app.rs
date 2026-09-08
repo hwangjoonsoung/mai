@@ -37,6 +37,7 @@ use unicode_width::UnicodeWidthStr;
 
 /// 이보다 많아지면 나란히 두지 않고 탭으로 바꾼다.
 pub const MAX_SPLIT: usize = 3;
+pub const MIN_PANE_WIDTH: u16 = 42;
 
 pub enum Mode {
     Panes,
@@ -48,6 +49,8 @@ pub enum Mode {
     Relay,
     /// 탭 이름을 고쳐 쓰는 중
     RenameTab,
+    /// 전역 또는 특정 칸의 보조 조작 메뉴.
+    Menu,
 }
 
 /// 마우스 클릭이 무엇을 가리키는가.
@@ -66,6 +69,17 @@ pub enum Hit {
     ShowAll,
     /// 탭 줄의 칩. 한 번 누르면 포커스, 두 번 누르면 이름 고치기.
     Tab(usize),
+    TopAdd,
+    TopMenu,
+    Relay(usize),
+    PaneMenu(usize),
+}
+
+#[derive(Clone, Copy)]
+enum ResizeDrag {
+    Sidebar,
+    Spaces,
+    Pane(usize),
 }
 
 pub struct App {
@@ -83,6 +97,7 @@ pub struct App {
     pub input: String,
     pub status: String,
     pub prefix: bool,
+    pub prefix_char: char,
     pub quit: bool,
 
     /// 사이드바 스크롤 오프셋 (줄 단위)
@@ -90,6 +105,19 @@ pub struct App {
     pub agent_scroll: u16,
     /// 탭 모드에서도 전부 나란히 본다. [전체] 탭이 켜는 값이다.
     pub show_all: bool,
+    pub zoomed: Option<usize>,
+    pub menu_pane: Option<usize>,
+    pub menu_selected: usize,
+    /// 사용자가 드래그로 조절하는 레이아웃 비율.
+    pub(crate) sidebar_width_percent: u16,
+    pub(crate) spaces_height_percent: u16,
+    pane_boundaries: Vec<u16>,
+    resize_drag: Option<ResizeDrag>,
+    sidebar_resize_hit: Option<Rect>,
+    spaces_resize_hit: Option<Rect>,
+    pane_resize_hit: Vec<(usize, Rect)>,
+    sidebar_area: Rect,
+    bodies_area: Rect,
 
     // ---- 마지막 렌더의 클릭 대상. 마우스 판정에 쓴다. ----
     pane_hit: Vec<(usize, Rect)>,
@@ -105,6 +133,10 @@ pub struct App {
     add_space_hit: Option<Rect>,
     add_session_hit: Option<Rect>,
     all_tab_hit: Option<Rect>,
+    top_add_hit: Option<Rect>,
+    top_menu_hit: Option<Rect>,
+    relay_hit: Vec<(usize, Rect)>,
+    pane_menu_hit: Vec<(usize, Rect)>,
     /// 사이드바의 두 칸 영역. 휠 스크롤을 어디에 적용할지 가른다.
     spaces_area: Rect,
     agents_area: Rect,
@@ -139,10 +171,27 @@ impl App {
             input: String::new(),
             status: String::new(),
             prefix: false,
+            prefix_char: std::env::var("MAI_PREFIX")
+                .ok()
+                .and_then(|s| s.chars().next())
+                .filter(|c| c.is_ascii())
+                .unwrap_or(']'),
             quit: false,
             space_scroll: 0,
             agent_scroll: 0,
             show_all: false,
+            zoomed: None,
+            menu_pane: None,
+            menu_selected: 0,
+            sidebar_width_percent: crate::sidebar::WIDTH_PERCENT,
+            spaces_height_percent: 50,
+            pane_boundaries: Vec::new(),
+            resize_drag: None,
+            sidebar_resize_hit: None,
+            spaces_resize_hit: None,
+            pane_resize_hit: Vec::new(),
+            sidebar_area: Rect::ZERO,
+            bodies_area: Rect::ZERO,
             pane_hit: Vec::new(),
             pane_inner: Vec::new(),
             selection: None,
@@ -154,6 +203,10 @@ impl App {
             add_space_hit: None,
             add_session_hit: None,
             all_tab_hit: None,
+            top_add_hit: None,
+            top_menu_hit: None,
+            relay_hit: Vec::new(),
+            pane_menu_hit: Vec::new(),
             spaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
             last_area: Rect::ZERO,
@@ -191,9 +244,53 @@ impl App {
             .collect()
     }
 
-    /// 탭 모드인가 — 보이는 세션이 MAX_SPLIT 을 넘는가.
-    pub fn tabbed(&self) -> bool {
-        self.visible().len() > MAX_SPLIT
+    pub fn open_menu(&mut self, pane: Option<usize>) {
+        self.menu_pane = pane;
+        self.menu_selected = 0;
+        self.mode = Mode::Menu;
+    }
+
+    pub fn prefix_label(&self) -> String {
+        format!("Ctrl+{}", self.prefix_char)
+    }
+
+    pub fn is_prefix_key(&self, code: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode;
+        if self.prefix_char == ']' {
+            matches!(code, KeyCode::Char(']'))
+                || (!cfg!(windows) && matches!(code, KeyCode::Char('5')))
+        } else {
+            matches!(code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&self.prefix_char))
+        }
+    }
+
+    pub fn prefix_byte(&self) -> u8 {
+        (self.prefix_char as u8) & 0x1f
+    }
+
+    pub fn cancel_menu(&mut self) {
+        self.menu_pane = None;
+        self.menu_selected = 0;
+        self.mode = Mode::Panes;
+    }
+
+    pub fn menu_items(&self) -> Vec<&'static str> {
+        if self.menu_pane.is_some() {
+            vec![
+                if self.zoomed.is_some() { "원래 배치로" } else { "이 칸 확대" },
+                "답변 전달",
+                "이름 바꾸기",
+                "칸 닫기",
+            ]
+        } else {
+            vec!["모두에게 묻기", "종료"]
+        }
+    }
+
+    pub fn toggle_zoom(&mut self, pane: usize) {
+        self.focus = pane;
+        self.zoomed = if self.zoomed == Some(pane) { None } else { Some(pane) };
+        self.show_all = false;
     }
 
     // ---------- 기동 ----------
@@ -258,6 +355,7 @@ impl App {
             return;
         }
         self.active_space = i;
+        self.zoomed = None;
         self.agent_scroll = 0;
         let vis = self.visible();
         if !vis.contains(&self.focus) {
@@ -346,6 +444,7 @@ impl App {
             p.kill();
         }
         self.sessions.remove(i);
+        self.zoomed = None;
         // 뒤 인덱스가 한 칸씩 당겨졌다. 포커스를 보정한다.
         if self.focus > i {
             self.focus -= 1;
@@ -457,10 +556,14 @@ impl App {
     /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다.
     pub fn sync_sizes(&mut self, area: Rect) {
         self.last_area = area;
-        let n = if self.tabbed() && !self.show_all { 1 } else { self.visible().len() };
-        let (h, w) = pane_size(area, n);
         for i in self.visible() {
             let s = &mut self.sessions[i];
+            let (h, w) = self
+                .pane_inner
+                .iter()
+                .find(|(pane, _)| *pane == i)
+                .map(|(_, r)| (r.height.max(6), r.width.max(20)))
+                .unwrap_or_else(|| pane_size(area, 1));
             if s.size != (h, w) {
                 if let Some(p) = s.pty.as_mut() {
                     let _ = p.resize(h, w);
@@ -617,6 +720,7 @@ impl App {
         }
         self.last_tab_click = Some((i, Instant::now()));
         self.focus = i;
+        self.zoomed = None;
         self.show_all = false;
     }
 
@@ -677,6 +781,22 @@ impl App {
     // ---------- 마우스 ----------
 
     pub fn hit_test(&self, x: u16, y: u16) -> Option<Hit> {
+        if self.top_add_hit.is_some_and(|r| contains(&r, x, y)) {
+            return Some(Hit::TopAdd);
+        }
+        if self.top_menu_hit.is_some_and(|r| contains(&r, x, y)) {
+            return Some(Hit::TopMenu);
+        }
+        for (i, r) in &self.relay_hit {
+            if contains(r, x, y) {
+                return Some(Hit::Relay(*i));
+            }
+        }
+        for (i, r) in &self.pane_menu_hit {
+            if contains(r, x, y) {
+                return Some(Hit::PaneMenu(*i));
+            }
+        }
         if let Some(r) = &self.add_space_hit {
             if contains(r, x, y) {
                 return Some(Hit::AddSpace);
@@ -746,7 +866,7 @@ impl App {
         }
 
         let target = if contains(&self.spaces_area, x, y) {
-            Some((&mut self.space_scroll, self.spaces.len() + 1))
+            Some((&mut self.space_scroll, self.spaces.len()))
         } else if contains(&self.agents_area, x, y) {
             let n = self.visible().len();
             Some((&mut self.agent_scroll, n))
@@ -783,6 +903,10 @@ impl App {
                 self.draw_panes(f);
                 self.draw_prompt_box(f, " 탭 이름 (Enter 확정 · Esc 취소) ");
             }
+            Mode::Menu => {
+                self.draw_panes(f);
+                self.draw_menu(f);
+            }
         }
     }
 
@@ -798,6 +922,13 @@ impl App {
         self.close_hit.clear();
         self.add_session_hit = None;
         self.all_tab_hit = None;
+        self.top_add_hit = None;
+        self.top_menu_hit = None;
+        self.relay_hit.clear();
+        self.pane_menu_hit.clear();
+        self.sidebar_resize_hit = None;
+        self.spaces_resize_hit = None;
+        self.pane_resize_hit.clear();
 
         let area = f.area();
         let vert = Layout::default()
@@ -805,20 +936,21 @@ impl App {
             .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
             .split(area);
 
-        // 최상단은 첫 질문이 아니라 **현재 공간의 경로**다.
-        // 질문은 각 에이전트 화면 안에 이미 남아 있고, 여기서 늘 필요한 정보는
-        // 「지금 어디서 돌고 있는가」다.
-        f.render_widget(
-            Paragraph::new(self.active_path().to_string_lossy().into_owned())
-                .style(Style::default().add_modifier(Modifier::BOLD))
-                .block(Block::default().borders(Borders::BOTTOM)),
-            vert[0],
-        );
+        self.draw_topbar(f, vert[0]);
 
         let main = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(crate::sidebar::WIDTH), Constraint::Min(20)])
+            .constraints([
+                Constraint::Percentage(self.sidebar_width_percent),
+                Constraint::Percentage(100 - self.sidebar_width_percent),
+            ])
             .split(vert[1]);
+        self.sidebar_resize_hit = Some(Rect {
+            x: main[1].x.saturating_sub(1),
+            y: main[0].y,
+            width: 2,
+            height: main[0].height,
+        });
         crate::sidebar::draw(f, main[0], self);
 
         let right = Layout::default()
@@ -829,8 +961,7 @@ impl App {
         self.draw_bodies(f, right[1]);
 
         let hint = if self.prefix {
-            "Ctrl+] 눌림 — f 답 넘기기 · t 터미널 · p 에이전트 · n 모두에게 묻기 · a Ctrl+A 를 자식에게 · q 종료 · 1..9 포커스"
-                .to_string()
+            format!("{} 대기 — f 답변 전달 · z 확대/복귀 · t 터미널 · p AI 추가 · n 모두에게 묻기 · ←/→/1..9 이동 · q 종료 · Esc 취소", self.prefix_label())
         } else {
             self.status.clone()
         };
@@ -840,12 +971,41 @@ impl App {
         );
     }
 
+    fn draw_topbar(&mut self, f: &mut Frame, area: Rect) {
+        let add = "[new tab]";
+        let menu = "[메뉴]";
+        let add_w = UnicodeWidthStr::width(add) as u16;
+        let menu_w = UnicodeWidthStr::width(menu) as u16;
+        let menu_x = area.right().saturating_sub(menu_w);
+        let add_x = menu_x.saturating_sub(add_w + 1);
+        let controls_start = add_x.saturating_sub(1);
+        let space = self.spaces.get(self.active_space).map(|s| s.name.as_str()).unwrap_or("공간 없음");
+        let path = self.active_path().to_string_lossy().into_owned();
+        let available = controls_start.saturating_sub(area.x) as usize;
+        let label = compact_tail(&format!(" {space} · {path}"), available);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ])).block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray))),
+            area,
+        );
+        if add_x < menu_x {
+            let add_rect = Rect { x: add_x, y: area.y, width: add_w, height: 1 };
+            f.render_widget(Paragraph::new(add).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), add_rect);
+            self.top_add_hit = Some(add_rect);
+        }
+        let menu_rect = Rect { x: menu_x, y: area.y, width: menu_w, height: 1 };
+        f.render_widget(Paragraph::new(menu).style(Style::default().fg(Color::Gray)), menu_rect);
+        self.top_menu_hit = Some(menu_rect);
+    }
+
     /// 탭 줄. 세션 칩들과 끝의 `+`.
     ///
     /// 탭 모드가 아니어도 그린다 — `+` 가 늘 같은 자리에 있어야 찾기 쉽다.
     fn draw_tabbar(&mut self, f: &mut Frame, area: Rect) {
         let vis = self.visible();
-        let tabbed = vis.len() > MAX_SPLIT;
+        let tabbed = vis.len() > MAX_SPLIT
+            || area.width / (vis.len().max(1) as u16) < MIN_PANE_WIDTH;
 
         let mut spans: Vec<Span> = Vec::new();
         let mut x = area.x;
@@ -870,7 +1030,7 @@ impl App {
             let s = &self.sessions[i];
             // 전체 보기 중에는 어떤 칩도 «선택된 탭»이 아니다. [전체] 가 선택돼 있다.
             let focused = i == self.focus && !self.show_all;
-            let label = format!(" {} ", s.title);
+            let label = format!(" {}·{} ", s.title, s.state().label());
             let w = UnicodeWidthStr::width(label.as_str()) as u16;
             let style = if focused {
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -886,22 +1046,15 @@ impl App {
             }
             x += w + 1;
         }
-        // 새 세션 버튼
-        if x + 3 <= area.right() {
-            spans.push(Span::styled(
-                "[+]",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ));
-            self.add_session_hit = Some(Rect { x, y: area.y, width: 3, height: 1 });
-        }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_bodies(&mut self, f: &mut Frame, area: Rect) {
+        self.bodies_area = area;
         let vis = self.visible();
         if vis.is_empty() {
             f.render_widget(
-                Paragraph::new("이 공간에 세션이 없다. [+] 터미널 · Ctrl+] 다음 p 에이전트.")
+                Paragraph::new("이 공간에 세션이 없습니다. 상단 [new tab]에서 시작하세요.")
                     .style(Style::default().fg(Color::DarkGray)),
                 area,
             );
@@ -909,38 +1062,71 @@ impl App {
         }
 
         // 넷 이상이면 포커스된 하나만 크게. 셋 이하면, 또는 [전체] 탭이면 나란히.
-        let shown: Vec<usize> = if vis.len() > MAX_SPLIT && !self.show_all {
+        let auto_tabbed = vis.len() > MAX_SPLIT
+            || area.width / (vis.len().max(1) as u16) < MIN_PANE_WIDTH;
+        let shown: Vec<usize> = if let Some(i) = self.zoomed.filter(|i| vis.contains(i)) {
+            vec![i]
+        } else if auto_tabbed && !self.show_all {
             vec![if vis.contains(&self.focus) { self.focus } else { vis[0] }]
         } else {
             vis.clone()
         };
         let n = shown.len().max(1);
+        if self.pane_boundaries.len() != n.saturating_sub(1) {
+            self.pane_boundaries = (1..n).map(|i| (i * 100 / n) as u16).collect();
+        }
+        let mut start = 0;
+        let mut constraints = Vec::with_capacity(n);
+        for end in self.pane_boundaries.iter().copied().chain(std::iter::once(100)) {
+            constraints.push(Constraint::Percentage(end.saturating_sub(start)));
+            start = end;
+        }
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(vec![Constraint::Ratio(1, n as u32); n])
+            .constraints(constraints)
             .split(area);
+
+        for i in 0..n.saturating_sub(1) {
+            self.pane_resize_hit.push((i, Rect {
+                x: cols[i + 1].x.saturating_sub(1),
+                y: area.y,
+                width: 2,
+                height: area.height,
+            }));
+        }
 
         for (slot, &i) in shown.iter().enumerate() {
             let s = &self.sessions[i];
             let a = cols[slot];
             let focused = i == self.focus;
             let border = if focused { Color::Cyan } else { Color::DarkGray };
+            let state = s.state();
+            let compact = a.width < 64;
+            let title = format!(" {} · {} ", s.title, state.label());
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
                 .border_style(Style::default().fg(border))
-                .title(format!(" {} ", s.title));
+                .title(Line::from(Span::styled(title, Style::default().fg(state.color()))));
             let inner = block.inner(a);
             f.render_widget(block, a);
 
             if a.width >= 6 {
-                let btn = Rect { x: a.right().saturating_sub(4), y: a.y, width: 3, height: 1 };
+                let menu_label = "[⋯]";
+                let menu_width = UnicodeWidthStr::width(menu_label) as u16;
+                let btn = Rect { x: a.right().saturating_sub(menu_width + 1), y: a.y, width: menu_width, height: 1 };
                 f.render_widget(
-                    Paragraph::new("[x]")
-                        .style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray })),
+                    Paragraph::new(menu_label).style(Style::default().fg(Color::Gray)),
                     btn,
                 );
-                self.close_hit.push((i, btn));
+                self.pane_menu_hit.push((i, btn));
+                if !compact {
+                    let relay_label = "[답변 전달]";
+                    let relay_width = UnicodeWidthStr::width(relay_label) as u16;
+                    let relay_btn = Rect { x: btn.x.saturating_sub(relay_width + 1), y: a.y, width: relay_width, height: 1 };
+                    f.render_widget(Paragraph::new(relay_label).style(Style::default().fg(Color::Cyan)), relay_btn);
+                    self.relay_hit.push((i, relay_btn));
+                }
             }
             self.pane_hit.push((i, a));
             self.pane_inner.push((i, inner));
@@ -985,6 +1171,32 @@ impl App {
                 ])
             })
             .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_menu(&self, f: &mut Frame) {
+        let items = self.menu_items();
+        let title = self.menu_pane
+            .and_then(|i| self.sessions.get(i).map(|s| format!(" {} 메뉴 · ↑↓ Enter · Esc ", s.title)))
+            .unwrap_or_else(|| " 전체 메뉴 · ↑↓ Enter · Esc ".to_string());
+        let width = items.iter().map(|s| UnicodeWidthStr::width(*s)).max().unwrap_or(10) as u16 + 8;
+        let area = center(f.area(), width.max(24), items.len() as u16 + 2);
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let lines: Vec<Line> = items.iter().enumerate().map(|(i, item)| {
+            let style = if i == self.menu_selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(format!(" {} {item}", if i == self.menu_selected { "›" } else { " " }), style))
+        }).collect();
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -1142,6 +1354,12 @@ impl App {
         self.agents_area = r;
         self.agent_hit.clear();
     }
+    pub(crate) fn set_sidebar_area(&mut self, r: Rect) {
+        self.sidebar_area = r;
+    }
+    pub(crate) fn set_spaces_resize_hit(&mut self, r: Rect) {
+        self.spaces_resize_hit = Some(r);
+    }
     pub(crate) fn push_space_hit(&mut self, i: usize, r: Rect) {
         self.space_hit.push((i, r));
     }
@@ -1150,6 +1368,67 @@ impl App {
     }
     pub(crate) fn set_add_space_hit(&mut self, r: Rect) {
         self.add_space_hit = Some(r);
+    }
+
+    /// 경계선 위에서 시작한 왼쪽 버튼 드래그를 레이아웃 조절로 잡는다.
+    pub fn begin_resize(&mut self, x: u16, y: u16) -> bool {
+        let drag = self
+            .pane_resize_hit
+            .iter()
+            .find(|(_, r)| contains(r, x, y))
+            .map(|(i, _)| ResizeDrag::Pane(*i))
+            .or_else(|| {
+                self.sidebar_resize_hit
+                    .filter(|r| contains(r, x, y))
+                    .map(|_| ResizeDrag::Sidebar)
+            })
+            .or_else(|| {
+                self.spaces_resize_hit
+                    .filter(|r| contains(r, x, y))
+                    .map(|_| ResizeDrag::Spaces)
+            });
+        self.resize_drag = drag;
+        drag.is_some()
+    }
+
+    pub fn resizing(&self) -> bool {
+        self.resize_drag.is_some()
+    }
+
+    pub fn drag_resize(&mut self, x: u16, y: u16) {
+        match self.resize_drag {
+            Some(ResizeDrag::Sidebar) if self.last_area.width > 0 => {
+                let min = (((10_u32 * 100).div_ceil(self.last_area.width as u32)) as u16).min(40);
+                let max = 60_u16.min(100_u16.saturating_sub(min.max(20))).max(min);
+                self.sidebar_width_percent = ((x as u32 * 100 / self.last_area.width as u32) as u16)
+                    .clamp(min, max);
+            }
+            Some(ResizeDrag::Spaces) if self.sidebar_area.height > 0 => {
+                let relative = y.saturating_sub(self.sidebar_area.y);
+                let min = (((3_u32 * 100).div_ceil(self.sidebar_area.height as u32)) as u16).min(45);
+                self.spaces_height_percent = ((relative as u32 * 100
+                    / self.sidebar_area.height as u32) as u16)
+                    .clamp(min, 100_u16.saturating_sub(min));
+            }
+            Some(ResizeDrag::Pane(i)) if self.bodies_area.width > 0 => {
+                let min = ((12_u32 * 100).div_ceil(self.bodies_area.width as u32)) as u16;
+                let previous = if i == 0 { 0 } else { self.pane_boundaries[i - 1] };
+                let next = self.pane_boundaries.get(i + 1).copied().unwrap_or(100);
+                let relative = x.saturating_sub(self.bodies_area.x);
+                let value = (relative as u32 * 100 / self.bodies_area.width as u32) as u16;
+                if previous.saturating_add(min) <= next.saturating_sub(min) {
+                    self.pane_boundaries[i] = value.clamp(
+                        previous.saturating_add(min),
+                        next.saturating_sub(min),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn end_resize(&mut self) {
+        self.resize_drag = None;
     }
 }
 
@@ -1237,10 +1516,27 @@ fn common_prefix(items: &[String]) -> String {
     first.chars().take(n).collect()
 }
 
-pub const HINT: &str = "[+] 칸 추가 · 탭 두 번 눌러 이름 바꾸기 · [x] 닫기 · 드래그 복사 · Ctrl+] 다음 n 모두에게 묻기 · Ctrl+] 다음 f 답 넘기기 · q 종료";
+pub const HINT: &str = "[+] 칸 추가 · 경계 드래그 크기 조절 · 탭 두 번 눌러 이름 바꾸기 · [x] 닫기 · 드래그 복사 · Ctrl+] 다음 n 모두에게 묻기 · Ctrl+] 다음 f 답 넘기기 · q 종료";
 
 fn contains(r: &Rect, x: u16, y: u16) -> bool {
     r.width > 0 && r.height > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+fn compact_tail(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while UnicodeWidthStr::width(chars.iter().collect::<String>().as_str()) > width - 1 {
+        if chars.is_empty() {
+            break;
+        }
+        chars.remove(0);
+    }
+    format!("…{}", chars.into_iter().collect::<String>())
 }
 
 fn center(area: Rect, w: u16, h: u16) -> Rect {
@@ -1268,7 +1564,11 @@ fn put_cursor(f: &mut Frame, inner: Rect, text: &str) {
 /// 패널 하나에 줄 PTY 크기. 테두리와 상하단 줄을 뺀 값이다.
 fn pane_size(area: Rect, n: usize) -> (u16, u16) {
     let n = n.max(1) as u16;
-    let usable = area.width.saturating_sub(crate::sidebar::WIDTH);
+    let sidebar_width = area
+        .width
+        .saturating_mul(crate::sidebar::WIDTH_PERCENT)
+        / 100;
+    let usable = area.width.saturating_sub(sidebar_width);
     let w = (usable / n).saturating_sub(2).max(20);
     // 상단 경로 2줄 + 탭 1줄 + 상태 1줄 + 테두리 2줄
     let h = area.height.saturating_sub(6).max(6);
@@ -1326,5 +1626,32 @@ mod tests {
         assert_eq!(common_prefix(&v(&["abc", "xyz"])), "");
         // 대소문자를 가리지 않는다.
         assert_eq!(common_prefix(&v(&["Desktop", "desktop2"])), "Desktop");
+    }
+
+    #[test]
+    fn 경계_드래그로_세_영역의_비율을_바꾼다() {
+        let mut app = App::new(&[]);
+
+        app.last_area = Rect::new(0, 0, 100, 40);
+        app.sidebar_resize_hit = Some(Rect::new(19, 2, 2, 37));
+        assert!(app.begin_resize(20, 10));
+        app.drag_resize(30, 10);
+        app.end_resize();
+        assert_eq!(app.sidebar_width_percent, 30);
+
+        app.sidebar_area = Rect::new(0, 2, 30, 37);
+        app.spaces_resize_hit = Some(Rect::new(0, 19, 30, 2));
+        assert!(app.begin_resize(10, 20));
+        app.drag_resize(10, 12);
+        app.end_resize();
+        assert_eq!(app.spaces_height_percent, 27);
+
+        app.bodies_area = Rect::new(30, 3, 70, 35);
+        app.pane_boundaries = vec![50];
+        app.pane_resize_hit = vec![(0, Rect::new(64, 3, 2, 35))];
+        assert!(app.begin_resize(65, 10));
+        app.drag_resize(72, 10);
+        app.end_resize();
+        assert_eq!(app.pane_boundaries, vec![60]);
     }
 }

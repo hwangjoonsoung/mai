@@ -62,6 +62,15 @@ impl State {
             State::Exited => Color::Red,
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            State::Starting => "시작 중",
+            State::Working => "출력 중",
+            State::Quiet => "대기",
+            State::Exited => "종료",
+        }
+    }
 }
 
 pub struct Session {

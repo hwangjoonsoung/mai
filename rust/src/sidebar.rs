@@ -15,14 +15,24 @@ use ratatui::{
     Frame,
 };
 
-pub const WIDTH: u16 = 26;
+pub const WIDTH_PERCENT: u16 = 20;
 
 pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        // spaces 와 agents 를 반반으로 나눈다.
-        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .constraints([
+            Constraint::Percentage(app.spaces_height_percent),
+            Constraint::Percentage(100 - app.spaces_height_percent),
+        ])
         .split(area);
+
+    app.set_sidebar_area(area);
+    app.set_spaces_resize_hit(Rect {
+        x: area.x,
+        y: rows[1].y.saturating_sub(1),
+        width: area.width,
+        height: 2,
+    });
 
     draw_spaces(f, rows[0], app);
     draw_agents(f, rows[1], app);
@@ -33,10 +43,20 @@ fn draw_spaces(f: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(" spaces ");
+        .title(" spaces ")
+        .title(
+            Line::from(Span::styled(" + ", Style::default().fg(Color::Green))).right_aligned(),
+        );
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.set_spaces_area(inner);
+    // 헤더 오른쪽 제목의 가운데 칸이 실제 `+` 위치다.
+    app.set_add_space_hit(Rect {
+        x: area.right().saturating_sub(3),
+        y: area.y,
+        width: 1,
+        height: 1,
+    });
 
     // 스크롤 오프셋만큼 건너뛰고 보이는 만큼만 그린다. 그래야 클릭 좌표와
     // 화면이 어긋나지 않는다.
@@ -45,16 +65,6 @@ fn draw_spaces(f: &mut Frame, area: Rect, app: &mut App) {
     let mut y = inner.y;
 
     let mut row = 0usize;
-    // 맨 위는 «새 공간» 버튼이다.
-    if row >= skip && y < inner.bottom() {
-        lines.push(Line::from(Span::styled(
-            "+ 새 공간",
-            Style::default().fg(Color::Green),
-        )));
-        app.set_add_space_hit(Rect { x: inner.x, y, width: inner.width, height: 1 });
-        y += 1;
-    }
-    row += 1;
 
     let active = app.active_space;
     let names: Vec<(usize, String, String)> = app
