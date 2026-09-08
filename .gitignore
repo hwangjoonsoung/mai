@@ -9,3 +9,9 @@ bin/
 
 # Rust 빌드 산출물
 rust/target/
+
+# 로컬 IDE 설정
+.idea/
+
+# 개인 작업 메모
+수정사항.md
