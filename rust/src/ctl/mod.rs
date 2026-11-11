@@ -86,7 +86,7 @@ pub fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("model") {
         let (Some(agent), Some(alias), None) = (args.get(1), args.get(2), args.get(3)) else { eprintln!("사용법: mai ctl model <에이전트> <별칭>"); return 2; };
         let Some(agent) = normalize(agent) else { eprintln!("알 수 없는 에이전트: {agent}"); return 2; };
-        println!("{}", models::resolve(agent, alias)); return 0;
+        println!("{}", models::resolve_fetching(agent, alias)); return 0;
     }
     #[cfg(unix)] { client::run(args) }
     #[cfg(not(unix))] { eprintln!("이 플랫폼에서는 mai ctl을 지원하지 않는다"); 2 }

@@ -421,8 +421,11 @@ mai 안에서 실행하면 같은 공간·경로에 검증 칸을 열고 답을 
 오류(시간 초과 등)로 끝난 칸은 무슨 일이 있었는지 볼 수 있게 남긴다.
 `--model`(`-m`)은 검증 칸을 띄울 때 그 CLI 의 `--model` 로 넘긴다.
 codex 는 `sol` · `astra` · `terra` 처럼 **계열 이름만 주면** `~/.codex/models_cache.json`
-에서 그 계열의 가장 최신 버전(`gpt-6.1-sol` 등)을 골라 넘긴다. claude 는 CLI 가
-별칭(`opus` 등)을 직접 받고, agy 는 준 이름 그대로 넘긴다(`agy models` 로 확인).
+에서 그 계열의 가장 최신 버전(`gpt-6.1-sol` 등)을 골라 넘긴다. agy 는 `agy models`
+출력을 `~/.multi-ai-cli/agy_models.txt` 에 하루 동안 캐시해 같은 규칙으로 푼다
+(`flash` → `gemini-3.8-flash-high`, `flash-low` 처럼 토큰을 여럿 줘도 된다). 캐시는
+mai 기동 때 뒤에서 채우고 `mai ctl model agy flash` 는 바로 가져온다. claude 는 CLI 가
+별칭(`opus` 등)을 직접 받으니 그대로 넘긴다.
 어떤 이름으로 넘어가는지는 `mai ctl model codex sol` 로 미리 본다.
 같은 요청자라도 (푼 뒤의) 모델이 다르면 다른 칸이다.
 

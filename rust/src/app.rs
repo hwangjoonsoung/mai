@@ -232,6 +232,7 @@ impl App {
     /// 뭔가는 해 보게 되기 때문이다.
     pub fn bootstrap(&mut self, area: Rect) {
         self.config = crate::room::Config::load();
+        crate::ctl::models::warm_agy_cache();
         #[cfg(unix)]
         if self.ctl.is_none() {
             match crate::ctl::server::Server::start() { Ok(server) => self.ctl = Some(server), Err(e) => self.status = format!("제어 소켓 기동 실패: {e}") }
