@@ -300,3 +300,36 @@ pub fn last_answer_since(agent: &str, cwd: &Path, since: Option<std::time::Syste
     let text = match agent { "claude" => claude_last(cwd, since), "codex" => codex_last(cwd, since), _ => None }?;
     Some(clamp(text, Origin::Session))
 }
+
+/// agy(화면 기반) 칸에서 **마지막 질문 블록 뒤의 답만** 꺼낸다.
+///
+/// 화면 전체를 돌려주면 배너·질문·입력창까지 섞인다. 우리가 넣은 질문은
+/// `"""` 로 감싸 두었으므로, 마지막 닫는 `"""` 뒤부터 입력창 테두리
+/// (`─` 로 시작하는 줄) 앞까지가 답이다. `▸ Thought for …` 같은 생각 표시줄은
+/// 뺀다. 질문 블록이 아직 안 보이면(스크롤·미주입) 화면 전체로 떨어진다.
+pub fn agy_answer(screen_text: &str) -> String {
+    let Some(end) = screen_text.rfind("\"\"\"") else { return screen_text.to_string() };
+    let after = &screen_text[end + 3..];
+    let mut out = Vec::new();
+    for line in after.lines().skip(1) {
+        let t = line.trim();
+        if t.starts_with('─') { break; }
+        if t.starts_with("▸ Thought") || t.starts_with("▸ Thinking") { continue; }
+        out.push(line.trim_end());
+    }
+    let joined = out.join("\n");
+    let start = joined.find(|c: char| !c.is_whitespace()).unwrap_or(joined.len());
+    joined[start..].trim_end().to_string()
+}
+
+#[cfg(test)]
+mod agy_tests {
+    use super::agy_answer;
+    #[test]
+    fn 마지막_질문_뒤_답만_남긴다() {
+        let screen = "배너\n> [zsh 의 검증 요청]\n  \"\"\"\n  1+1은?\n  \"\"\"\n\n▸ Thought for 3s, 151 tokens\n\n  2\n  둘째 줄\n\n──────\n>\n──────\n? for shortcuts";
+        assert_eq!(agy_answer(screen), "2\n  둘째 줄");
+        assert_eq!(agy_answer("아직 질문 없음"), "아직 질문 없음");
+        assert_eq!(agy_answer("> q\n  \"\"\"\n  x\n  \"\"\"\n\n▸ Thought for 1s\n──────\n>"), "");
+    }
+}

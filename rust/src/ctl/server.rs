@@ -29,7 +29,7 @@ fn install_signal_cleanup(path: &Path, dir: &Path) {
     let _ = SOCKET_DIR.set(d);
     for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
         // SAFETY: 핸들러는 위에서 정의한 extern "C" 함수다.
-        unsafe { libc::signal(sig, on_signal as libc::sighandler_t); }
+        unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t); }
     }
 }
 

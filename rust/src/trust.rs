@@ -13,7 +13,8 @@
 //!   codex   ~/.codex/config.toml  [projects."<경로>"] trust_level = "trusted"
 //!           경로 표기는 OS 마다 다르다 — Windows 는 소문자 + 이스케이프된
 //!           역슬래시, macOS/Linux 는 원본 경로 그대로다 (실측).
-//!   agy     신뢰 대화상자를 쓰지 않는다 (확인된 바 없음)
+//!   agy     ~/.gemini/antigravity-cli/settings.json  trustedWorkspaces = ["<경로>", …]
+//!           정확히 같은 경로여야 한다 — 홈이 등록돼 있어도 하위 저장소는 다시 묻는다 (실측).
 
 use anyhow::{Context, Result};
 use std::{fs, path::Path};
@@ -31,10 +32,7 @@ pub fn trust_workspace(ws: &Path) -> Vec<Report> {
     vec![
         Report { agent: "claude", outcome: describe(trust_claude(&display)) },
         Report { agent: "codex", outcome: describe(trust_codex(&display)) },
-        Report {
-            agent: "agy",
-            outcome: "해당 없음 (신뢰 대화상자를 쓰지 않는다)".into(),
-        },
+        Report { agent: "agy", outcome: describe(trust_agy(&display)) },
     ]
 }
 
@@ -126,6 +124,33 @@ fn trust_codex(ws: &str) -> Result<bool> {
     out.push('\n');
     out.push_str("trust_level = \"trusted\"\n");
     write_atomic(&path, &out)?;
+    Ok(true)
+}
+
+// ---------- agy ----------
+
+/// `~/.gemini/antigravity-cli/settings.json` 의 `trustedWorkspaces` 배열에 경로를 넣는다.
+///
+/// 파일이 작고 키가 하나뿐이지만, 모르는 키가 생길 수 있으니 JSON 으로 읽어
+/// 그 배열만 고치고 나머지는 그대로 다시 쓴다. 파일이 없으면 새로 만든다.
+fn trust_agy(ws: &str) -> Result<bool> {
+    let path = home()?.join(".gemini").join("antigravity-cli").join("settings.json");
+    let mut root: serde_json::Value = if path.is_file() {
+        serde_json::from_str(&fs::read_to_string(&path).context("agy 설정을 읽지 못했다")?).context("agy 설정이 JSON 이 아니다")?
+    } else {
+        serde_json::json!({})
+    };
+    let obj = root.as_object_mut().context("agy 설정의 최상위가 객체가 아니다")?;
+    let list = obj.entry("trustedWorkspaces").or_insert_with(|| serde_json::Value::Array(vec![]));
+    let list = list.as_array_mut().context("trustedWorkspaces 가 배열이 아니다")?;
+    if list.iter().any(|v| v.as_str() == Some(ws)) {
+        return Ok(false);
+    }
+    list.push(serde_json::Value::String(ws.to_string()));
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).context("agy 설정 디렉터리를 만들지 못했다")?;
+    }
+    write_atomic(&path, &(serde_json::to_string_pretty(&root).context("agy 설정을 직렬화하지 못했다")? + "\n"))?;
     Ok(true)
 }
 

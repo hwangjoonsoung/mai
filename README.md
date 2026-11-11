@@ -430,16 +430,27 @@ codex 는 `sol` · `astra` · `terra` 처럼 **계열 이름만 주면** `~/.cod
 mai ctl ask codex "이 구현을 검증해줘"              # 답 받으면 칸을 닫는다
 mai ctl ask -k codex "이어서 물어볼 거야"            # --keep: 칸을 남긴다
 mai ctl ask codex -m sol "모델을 골라 묻는다"        # --model. 계열 이름이면 최신 버전. 옵션 위치는 자유
+mai ctl ask codex:sol,claude "둘에게 동시에"        # 여러 대상. 에이전트별 섹션으로 합쳐 돌려준다
 mai ctl model codex sol                             # → gpt-6.1-sol 처럼 풀린 이름
 mai ctl ask --timeout 600 Claude "이 답변을 검증해줘"
 printf '%s' '긴 질문' | mai ctl ask Gemini -
+mai ctl status                                      # 칸 목록 · 진행 중 요청 · 경과 시간
+mai ctl screen 3                                    # 칸 3 의 화면 글자 (디버깅)
 mai ctl instructions
 ```
+
+여러 대상은 `에이전트[:모델]` 을 쉼표로 잇는다. 동시에 묻고, 전부 끝나면
+`## Codex(sol)` 같은 머리말로 나눠 요청한 순서대로 합친다. 일부가 실패하면
+그 칸은 `(검증하지 못했다: …)` 로 적고 종료 코드 1, 실패 목록은 stderr 다.
+같은 요청자의 진행 중 요청은 대상이 같으면 합류하고 다르면 거절한다.
 
 기본 대기는 무제한이다. 성공은 종료 코드 0, 서버·통신 오류는 1,
 잘못된 사용법과 mai 밖 실행은 2다. 신뢰 대화상자는 사용자가 확인한다.
 검증자는 재검증을 요청할 수 없다. 동일 요청자의 같은 대상 진행 중 요청은
-합쳐지므로 다른 질문도 앞 요청이 끝난 뒤 보낸다. Gemini는 화면 내용을 반환한다.
+합쳐지므로 다른 질문도 앞 요청이 끝난 뒤 보낸다. Gemini는 세션 기록이 없어
+화면에서 마지막 질문 블록 뒤의 답만 잘라 돌려준다. 에이전트가 폴더 신뢰를
+물으면 주입을 미루므로, 먼저 그 디렉터리에서 `mai --trust` 를 한 번 해 둔다
+(claude · codex · agy 모두 등록한다).
 Windows 제어 통로는 아직 지원하지 않는다.
 
 실제 CLI의 응답 종료 판정, 동시에 시작한 동일 에이전트의 기록 구분,

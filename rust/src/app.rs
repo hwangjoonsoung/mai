@@ -69,16 +69,24 @@ pub enum Hit {
 
 #[cfg(unix)]
 struct Ask {
-    requester: u64, verifier: u64, agent: String, baseline: Option<String>,
+    group: u64, verifier: u64, target: crate::ctl::Target, baseline: Option<String>,
     injected_at: Option<Instant>, deadline: Option<Instant>,
+}
+/// 한 번의 `mai ctl ask` — 대상이 여럿이면 답을 모아 한 번에 돌려준다.
+#[cfg(unix)]
+struct AskGroup {
+    id: u64, requester: u64, targets: Vec<crate::ctl::Target>,
     /// 답을 받은 뒤에도 검증 칸을 남겨 둔다(`--keep`). 기본은 1회성이라 닫는다.
     keep: bool,
+    started: Instant,
+    results: Vec<(crate::ctl::Target, crate::ctl::Response)>,
     waiters: Vec<std::os::unix::net::UnixStream>,
 }
 pub struct App {
     next_id: u64,
     #[cfg(unix)] ctl: Option<crate::ctl::server::Server>,
     #[cfg(unix)] asks: Vec<Ask>,
+    #[cfg(unix)] groups: Vec<AskGroup>,
     #[cfg(unix)] asks_checked: Instant,
     pub spaces: Vec<Space>,
     pub active_space: usize,
@@ -141,6 +149,7 @@ impl App {
             next_id: 1,
             #[cfg(unix)] ctl: None,
             #[cfg(unix)] asks: Vec::new(),
+            #[cfg(unix)] groups: Vec::new(),
             #[cfg(unix)] asks_checked: Instant::now(),
             spaces: vec![Space::new(cwd)],
             active_space: 0,
@@ -1280,58 +1289,119 @@ impl App {
         #[cfg(unix)] if let Some(server) = &self.ctl { env.push(("MAI_CTL", server.path.as_os_str().to_owned())); }
         env
     }
+
     #[cfg(unix)]
     fn receive_asks(&mut self) {
         loop {
             let Some((req, stream)) = self.ctl.as_ref().and_then(|s| s.rx.try_recv().ok()) else { break };
-            if let Err((stream, error)) = self.begin_ask(req, stream) { crate::ctl::server::reply(stream, &crate::ctl::Response::error(error)); }
+            let result = match req.op.as_str() {
+                "ask" => self.begin_ask(req, stream),
+                "status" => Err((stream, crate::ctl::Response::answer(serde_json::to_string(&self.status()).unwrap_or_default()))),
+                "screen" => Err((stream, self.screen_of(req.target_pane))),
+                _ => Err((stream, crate::ctl::Response::error("잘못된 요청"))),
+            };
+            if let Err((stream, response)) = result { crate::ctl::server::reply(stream, &response); }
         }
     }
+
+    /// `mai ctl status` — 칸 목록과 진행 중 요청.
     #[cfg(unix)]
-    fn begin_ask(&mut self, req: crate::ctl::Request, stream: std::os::unix::net::UnixStream) -> Result<(), (std::os::unix::net::UnixStream, String)> {
-        let Some(i) = self.by_id(req.pane) else { return Err((stream, "요청자 칸이 없다".into())) };
-        if req.role == "verifier" || self.sessions[i].verifier_of.is_some() { return Err((stream, "검증자 칸에서는 다시 검증을 요청할 수 없다".into())); }
-        let Some(agent) = crate::ctl::normalize(&req.agent) else { return Err((stream, "알 수 없는 에이전트".into())) };
-        if req.op != "ask" || req.question.trim().is_empty() { return Err((stream, "잘못된 요청".into())); }
-        let deadline = match req.timeout_secs { Some(t) => match Instant::now().checked_add(Duration::from_secs(t)) { Some(d) => Some(d), None => return Err((stream, "시간 제한이 너무 크다".into())) }, None => None };
-        if let Some(ask) = self.asks.iter_mut().find(|a| a.requester == req.pane) {
-            if ask.agent != agent { return Err((stream, "이미 진행 중".into())); }
-            ask.keep |= req.keep; ask.waiters.push(stream); return Ok(());
+    fn status(&self) -> crate::ctl::Status {
+        let panes = self.sessions.iter().map(|s| crate::ctl::PaneStatus {
+            id: s.id, title: s.title.clone(), agent: s.agent_id.clone(),
+            role: if s.verifier_of.is_some() { "verifier" } else if s.is_terminal { "terminal" } else { "main" }.into(),
+            verifier_of: s.verifier_of, model: s.model.clone(),
+            cwd: s.cwd.clone().unwrap_or_else(|| self.spaces[s.space].path.clone()).to_string_lossy().into_owned(),
+            alive: s.pty.as_ref().is_some_and(|p| !p.finished()), pending: s.pending.is_some(),
+        }).collect();
+        let asks = self.asks.iter().map(|a| {
+            let group = self.groups.iter().find(|g| g.id == a.group);
+            crate::ctl::AskStatus {
+                requester: group.map_or(0, |g| g.requester), verifier: a.verifier, agent: a.target.agent.clone(), model: a.target.model.clone(),
+                elapsed_secs: group.map_or(0, |g| g.started.elapsed().as_secs()),
+                remaining_secs: a.deadline.map(|d| d.saturating_duration_since(Instant::now()).as_secs()),
+                injected: a.injected_at.is_some(),
+            }
+        }).collect();
+        crate::ctl::Status { panes, asks }
+    }
+
+    /// `mai ctl screen <id>` — 그 칸의 화면 글자. 디버깅용.
+    #[cfg(unix)]
+    fn screen_of(&self, id: Option<u64>) -> crate::ctl::Response {
+        let Some(i) = id.and_then(|id| self.by_id(id)) else { return crate::ctl::Response::error("그런 칸이 없다") };
+        match self.sessions[i].pty.as_ref() {
+            Some(p) => crate::ctl::Response::answer(crate::relay::from_screen(&p.screen()).text),
+            None => crate::ctl::Response::error("칸에 프로세스가 없다"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn begin_ask(&mut self, req: crate::ctl::Request, stream: std::os::unix::net::UnixStream) -> Result<(), (std::os::unix::net::UnixStream, crate::ctl::Response)> {
+        let fail = |stream, msg: &str| Err((stream, crate::ctl::Response::error(msg)));
+        let Some(i) = self.by_id(req.pane) else { return fail(stream, "요청자 칸이 없다") };
+        if req.role == "verifier" || self.sessions[i].verifier_of.is_some() { return fail(stream, "검증자 칸에서는 다시 검증을 요청할 수 없다"); }
+        if req.question.trim().is_empty() { return fail(stream, "잘못된 요청"); }
+        let mut targets = req.targets();
+        for t in &mut targets {
+            let Some(agent) = crate::ctl::normalize(&t.agent) else { return fail(stream, "알 수 없는 에이전트") };
+            t.agent = agent.into();
+            // `-m sol` 같은 계열 이름은 그 CLI 의 최신 모델 이름으로 푼다.
+            t.model = t.model.as_deref().map(|m| crate::ctl::models::resolve(agent, m));
+        }
+        let deadline = match req.timeout_secs { Some(t) => match Instant::now().checked_add(Duration::from_secs(t)) { Some(d) => Some(d), None => return fail(stream, "시간 제한이 너무 크다") }, None => None };
+        // 같은 요청자의 진행 중 요청: 대상이 같으면 합류, 다르면 거절.
+        if let Some(g) = self.groups.iter_mut().find(|g| g.requester == req.pane) {
+            if g.targets != targets { return fail(stream, "이미 진행 중") }
+            g.keep |= req.keep; g.waiters.push(stream); return Ok(());
         }
         let cwd = self.sessions[i].cwd.clone().unwrap_or_else(|| self.spaces[self.sessions[i].space].path.clone());
         let title = self.sessions[i].title.clone(); let space = self.sessions[i].space;
-        // `-m sol` 같은 계열 이름은 그 CLI 의 최신 모델 이름으로 푼다.
-        let model = req.model.as_deref().map(|m| crate::ctl::models::resolve(agent, m));
-        let existing = self.sessions.iter().position(|s| s.verifier_of == Some(req.pane) && s.agent_id == agent && s.cwd.as_ref() == Some(&cwd) && s.model == model && s.pty.as_ref().is_some_and(|p| !p.finished()));
-        let v = if let Some(v) = existing { v } else {
-            let id = self.next_id; self.next_id += 1;
-            let env = self.control_env(id, "verifier");
-            let (h, w) = pane_size(self.last_area, (self.visible().len()+1).min(MAX_SPLIT));
-            let spawned_at = std::time::SystemTime::now();
-            // 세 CLI 모두 `--model <이름>` 을 받는다(claude · codex · agy).
-            let extra: Vec<String> = model.iter().flat_map(|m| ["--model".to_string(), m.clone()]).collect();
-            let pty = match PtySession::spawn_controlled(Some(agent), h, w, &cwd, &env, &extra) { Ok(p) => p, Err(e) => return Err((stream, e.to_string())) };
-            let display = crate::AGENTS.iter().find(|(a, _)| *a == agent).unwrap().1;
-            let label = match &model { Some(m) => format!("{display}({m}) ← {title}"), None => format!("{display} ← {title}") };
-            let mut session = Session::new(agent, &label, space);
-            session.id = id; session.verifier_of = Some(req.pane); session.model = model.clone(); session.spawned_at = Some(spawned_at);
-            session.cwd = Some(cwd.clone()); session.pty = Some(pty); session.size = (h,w); session.started = Some(Instant::now());
-            self.sessions.push(session); self.sessions.len()-1
-        };
-        let baseline = crate::relay::last_answer_since(agent, &cwd, self.sessions[v].spawned_at).map(|q| q.text);
-        self.sessions[v].pending = Some(format!("\x1b[200~[{title} 의 검증 요청]\n\"\"\"\n{}\n\"\"\"\x1b[201~", req.question));
-        self.sessions[v].user_typed = false;
-        self.asks.push(Ask { requester: req.pane, verifier: self.sessions[v].id, agent: agent.into(), baseline, injected_at: None, deadline, keep: req.keep, waiters: vec![stream] });
+        let group_id = self.next_id; self.next_id += 1;
+        let mut asks = Vec::new();
+        for target in &targets {
+            let v = match self.verifier_pane(req.pane, target, &cwd, &title, space) { Ok(v) => v, Err(e) => { for a in asks { self.asks.push(a); } return Err((stream, crate::ctl::Response::error(e))) } };
+            let baseline = crate::relay::last_answer_since(&target.agent, &cwd, self.sessions[v].spawned_at).map(|q| q.text);
+            self.sessions[v].pending = Some(format!("\x1b[200~[{title} 의 검증 요청]\n\"\"\"\n{}\n\"\"\"\x1b[201~", req.question));
+            self.sessions[v].user_typed = false;
+            asks.push(Ask { group: group_id, verifier: self.sessions[v].id, target: target.clone(), baseline, injected_at: None, deadline });
+        }
+        self.asks.extend(asks);
+        self.groups.push(AskGroup { id: group_id, requester: req.pane, targets, keep: req.keep, started: Instant::now(), results: Vec::new(), waiters: vec![stream] });
         Ok(())
     }
+
+    /// 대상에 맞는 검증 칸을 찾거나 새로 띄운다. 반환은 sessions 인덱스.
+    #[cfg(unix)]
+    fn verifier_pane(&mut self, requester: u64, target: &crate::ctl::Target, cwd: &PathBuf, title: &str, space: usize) -> Result<usize, String> {
+        let agent = target.agent.as_str();
+        let existing = self.sessions.iter().position(|s| s.verifier_of == Some(requester) && s.agent_id == agent && s.cwd.as_ref() == Some(cwd) && s.model == target.model && s.pending.is_none() && s.pty.as_ref().is_some_and(|p| !p.finished()));
+        if let Some(v) = existing { return Ok(v); }
+        let id = self.next_id; self.next_id += 1;
+        let env = self.control_env(id, "verifier");
+        let (h, w) = pane_size(self.last_area, (self.visible().len()+1).min(MAX_SPLIT));
+        let spawned_at = std::time::SystemTime::now();
+        // 세 CLI 모두 `--model <이름>` 을 받는다(claude · codex · agy).
+        let extra: Vec<String> = target.model.iter().flat_map(|m| ["--model".to_string(), m.clone()]).collect();
+        let pty = PtySession::spawn_controlled(Some(agent), h, w, cwd, &env, &extra).map_err(|e| e.to_string())?;
+        let display = crate::ctl::display(agent);
+        let label = match &target.model { Some(m) => format!("{display}({m}) ← {title}"), None => format!("{display} ← {title}") };
+        let mut session = Session::new(agent, &label, space);
+        session.id = id; session.verifier_of = Some(requester); session.model = target.model.clone(); session.spawned_at = Some(spawned_at);
+        session.cwd = Some(cwd.clone()); session.pty = Some(pty); session.size = (h, w); session.started = Some(Instant::now());
+        self.sessions.push(session);
+        Ok(self.sessions.len() - 1)
+    }
+
     #[cfg(unix)]
     fn finish_asks(&mut self) {
         if self.asks_checked.elapsed() < Duration::from_millis(500) { return; }
         self.asks_checked = Instant::now();
         let asks = std::mem::take(&mut self.asks);
         for mut ask in asks {
+            let requester_gone = self.groups.iter().find(|g| g.id == ask.group).map_or(true, |g| self.by_id(g.requester).is_none());
             let result = if ask.deadline.is_some_and(|d| Instant::now() >= d) { Some(crate::ctl::Response::error("검증 시간 초과")) }
-            else if self.by_id(ask.requester).is_none() { Some(crate::ctl::Response::error("요청자 칸이 닫혔다")) }
+            else if requester_gone { Some(crate::ctl::Response::error("요청자 칸이 닫혔다")) }
             else if let Some(v) = self.by_id(ask.verifier) {
                 let s = &mut self.sessions[v];
                 if s.pty.as_ref().map_or(true, |p| p.finished()) { Some(crate::ctl::Response::error("검증자 칸이 종료됐다")) }
@@ -1341,20 +1411,28 @@ impl App {
                     let screen = s.pty.as_ref().unwrap().screen();
                     if injected.elapsed() < Duration::from_millis(2500) || s.seen.1.elapsed() < Duration::from_millis(2500) || crate::modal::open(&screen) { None }
                     else {
-                        let quote = if ask.agent == "agy" { Some(crate::relay::from_screen(&screen)) } else { crate::relay::last_answer_since(&ask.agent, s.cwd.as_ref().unwrap(), s.spawned_at) };
+                        let quote = if ask.target.agent == "agy" { let mut q = crate::relay::from_screen(&screen); q.text = crate::relay::agy_answer(&q.text); Some(q) } else { crate::relay::last_answer_since(&ask.target.agent, s.cwd.as_ref().unwrap(), s.spawned_at) };
                         quote.filter(|q| !q.text.trim().is_empty() && Some(&q.text) != ask.baseline.as_ref()).map(|q| crate::ctl::Response { ok: true, answer: Some(q.text), origin: Some(q.origin.label().into()), error: None })
                     }
                 }
             } else { Some(crate::ctl::Response::error("검증자 칸이 닫혔다")) };
-            if let Some(response) = result {
-                if !response.ok { if let Some(v) = self.by_id(ask.verifier) { self.sessions[v].pending = None; } }
-                for stream in ask.waiters { crate::ctl::server::reply(stream, &response); }
+            let Some(response) = result else { self.asks.push(ask); continue };
+            let keep = self.groups.iter().find(|g| g.id == ask.group).is_some_and(|g| g.keep);
+            if let Some(v) = self.by_id(ask.verifier) {
+                if !response.ok { self.sessions[v].pending = None; }
                 // 1회성 질문이면 답을 돌려준 뒤 검증 칸을 닫는다. 오류로 끝난 칸은
                 // 무슨 일이 있었는지 볼 수 있게 남긴다.
-                if response.ok && !ask.keep {
-                    if let Some(v) = self.by_id(ask.verifier) { self.close_session(v); self.status = "검증 칸을 닫았다".into(); }
-                }
-            } else { self.asks.push(ask); }
+                else if !keep { self.close_session(v); self.status = "검증 칸을 닫았다".into(); }
+            }
+            if let Some(g) = self.groups.iter_mut().find(|g| g.id == ask.group) { g.results.push((ask.target, response)); }
+        }
+        // 대상 전부의 답이 모이면 합쳐서 돌려준다.
+        let done: Vec<AskGroup> = { let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.groups).into_iter().partition(|g| g.results.len() >= g.targets.len()); self.groups = rest; done };
+        for mut g in done {
+            // 요청 순서대로 정렬한다. 답은 끝난 순서로 쌓였다.
+            g.results.sort_by_key(|(t, _)| g.targets.iter().position(|x| x == t).unwrap_or(usize::MAX));
+            let response = crate::ctl::combine(&g.results);
+            for stream in g.waiters { crate::ctl::server::reply(stream, &response); }
         }
     }
 }
