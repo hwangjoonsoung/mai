@@ -36,6 +36,10 @@ pub fn rooms_dir() -> PathBuf {
 pub struct Config {
     pub agy_model: String,
     pub ui_mode: String,
+    /// `mai ctl ask` 의 기본 대기 시간(초). 0 이면 무제한.
+    pub ctl_timeout: u64,
+    /// `mai ctl ask` 에서 `-m` 을 생략했을 때 에이전트별 기본 모델(별칭 가능).
+    pub ctl_model: std::collections::HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -43,6 +47,8 @@ impl Default for Config {
         Self {
             agy_model: "gemini-3.1-pro-high".into(),
             ui_mode: "tui".into(),
+            ctl_timeout: 0,
+            ctl_model: std::collections::HashMap::new(),
         }
     }
 }
@@ -54,12 +60,17 @@ impl Config {
     /// 몇 개뿐이라 `키 = "값"` 만 훑으면 충분하다.
     pub fn load() -> Self {
         let path = home().join("config.toml");
-        let mut c = Config::default();
         let Ok(text) = fs::read_to_string(&path) else {
             let _ = fs::create_dir_all(home());
             let _ = fs::write(&path, DEFAULT_CONFIG);
-            return c;
+            return Config::default();
         };
+        Self::parse(&text)
+    }
+
+    /// `키 = "값"` 줄만 훑는다. 모르는 키는 지나친다.
+    pub fn parse(text: &str) -> Self {
+        let mut c = Config::default();
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with('#') {
@@ -70,6 +81,10 @@ impl Config {
             match k.trim() {
                 "agy_model" if !v.is_empty() => c.agy_model = v.into(),
                 "ui_mode" if !v.is_empty() => c.ui_mode = v.into(),
+                "ctl_timeout" => c.ctl_timeout = v.parse().unwrap_or(0),
+                k if k.starts_with("ctl_model_") && !v.is_empty() => {
+                    if let Some(agent) = crate::ctl::normalize(&k["ctl_model_".len()..]) { c.ctl_model.insert(agent.into(), v.into()); }
+                }
                 _ => {}
             }
         }
@@ -85,7 +100,30 @@ agy_model = "gemini-3.1-pro-high"
 
 # 화면 모드. 지금은 tui 만 있다.
 ui_mode = "tui"
+
+# `mai ctl ask` 기본값. 명령줄 옵션이 있으면 그쪽이 이긴다.
+# 대기 시간(초). 0 이면 무제한.
+ctl_timeout = 0
+# 에이전트별 기본 모델. 계열 이름(sol · astra · terra)이면 최신 버전으로 푼다.
+# ctl_model_codex = "sol"
+# ctl_model_claude = "opus"
+# ctl_model_agy = "gemini-3.8-flash-high"
 "#;
+
+#[cfg(test)]
+mod config_tests {
+    use super::Config;
+    #[test]
+    fn ctl_기본값을_읽는다() {
+        let c = Config::parse("ctl_timeout = 600\nctl_model_codex = \"sol\"\nctl_model_Gemini = \"flash\"\nctl_model_nope = \"x\"\n# ctl_model_claude = \"opus\"\n");
+        assert_eq!(c.ctl_timeout, 600);
+        assert_eq!(c.ctl_model.get("codex").map(String::as_str), Some("sol"));
+        assert_eq!(c.ctl_model.get("agy").map(String::as_str), Some("flash"));
+        assert!(c.ctl_model.get("claude").is_none()); assert_eq!(c.ctl_model.len(), 2);
+        let d = Config::parse(super::DEFAULT_CONFIG);
+        assert_eq!(d.ctl_timeout, 0); assert!(d.ctl_model.is_empty()); assert_eq!(d.agy_model, "gemini-3.1-pro-high");
+    }
+}
 
 // ---------- 방 ----------
 

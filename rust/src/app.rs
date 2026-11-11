@@ -88,6 +88,8 @@ pub struct App {
     #[cfg(unix)] asks: Vec<Ask>,
     #[cfg(unix)] groups: Vec<AskGroup>,
     #[cfg(unix)] asks_checked: Instant,
+    /// ~/.multi-ai-cli/config.toml. bootstrap 에서 읽는다.
+    config: crate::room::Config,
     pub spaces: Vec<Space>,
     pub active_space: usize,
     pub sessions: Vec<Session>,
@@ -151,6 +153,7 @@ impl App {
             #[cfg(unix)] asks: Vec::new(),
             #[cfg(unix)] groups: Vec::new(),
             #[cfg(unix)] asks_checked: Instant::now(),
+            config: crate::room::Config::default(),
             spaces: vec![Space::new(cwd)],
             active_space: 0,
             sessions: Vec::new(),
@@ -228,6 +231,7 @@ impl App {
     /// 터미널을 기본으로 두는 이유는, 무엇을 붙일지 정하기 전에도 그 경로에서
     /// 뭔가는 해 보게 되기 때문이다.
     pub fn bootstrap(&mut self, area: Rect) {
+        self.config = crate::room::Config::load();
         #[cfg(unix)]
         if self.ctl.is_none() {
             match crate::ctl::server::Server::start() { Ok(server) => self.ctl = Some(server), Err(e) => self.status = format!("제어 소켓 기동 실패: {e}") }
@@ -1346,10 +1350,12 @@ impl App {
         for t in &mut targets {
             let Some(agent) = crate::ctl::normalize(&t.agent) else { return fail(stream, "알 수 없는 에이전트") };
             t.agent = agent.into();
-            // `-m sol` 같은 계열 이름은 그 CLI 의 최신 모델 이름으로 푼다.
+            // `-m` 이 없으면 설정의 에이전트별 기본 모델. 계열 이름은 최신 버전으로 푼다.
+            if t.model.is_none() { t.model = self.config.ctl_model.get(agent).cloned(); }
             t.model = t.model.as_deref().map(|m| crate::ctl::models::resolve(agent, m));
         }
-        let deadline = match req.timeout_secs { Some(t) => match Instant::now().checked_add(Duration::from_secs(t)) { Some(d) => Some(d), None => return fail(stream, "시간 제한이 너무 크다") }, None => None };
+        let timeout = req.timeout_secs.or_else(|| (self.config.ctl_timeout > 0).then_some(self.config.ctl_timeout));
+        let deadline = match timeout { Some(t) => match Instant::now().checked_add(Duration::from_secs(t)) { Some(d) => Some(d), None => return fail(stream, "시간 제한이 너무 크다") }, None => None };
         // 같은 요청자의 진행 중 요청: 대상이 같으면 합류, 다르면 거절.
         if let Some(g) = self.groups.iter_mut().find(|g| g.requester == req.pane) {
             if g.targets != targets { return fail(stream, "이미 진행 중") }

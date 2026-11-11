@@ -439,6 +439,14 @@ mai ctl screen 3                                    # 칸 3 의 화면 글자 (�
 mai ctl instructions
 ```
 
+기본값은 `~/.multi-ai-cli/config.toml` 에 둘 수 있다. 명령줄 옵션이 있으면 그쪽이 이긴다.
+
+```toml
+ctl_timeout = 600            # 초. 0 이면 무제한
+ctl_model_codex = "sol"      # -m 을 생략했을 때. 계열 이름이면 최신 버전
+ctl_model_claude = "opus"
+```
+
 여러 대상은 `에이전트[:모델]` 을 쉼표로 잇는다. 동시에 묻고, 전부 끝나면
 `## Codex(sol)` 같은 머리말로 나눠 요청한 순서대로 합친다. 일부가 실패하면
 그 칸은 `(검증하지 못했다: …)` 로 적고 종료 코드 1, 실패 목록은 stderr 다.
