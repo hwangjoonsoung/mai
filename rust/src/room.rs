@@ -40,6 +40,8 @@ pub struct Config {
     pub ctl_timeout: u64,
     /// `mai ctl ask` 에서 `-m` 을 생략했을 때 에이전트별 기본 모델(별칭 가능).
     pub ctl_model: std::collections::HashMap<String, String>,
+    /// `mai ctl ask` 기록을 ~/.multi-ai-cli/ctl_history.jsonl 에 남긴다.
+    pub ctl_history: bool,
 }
 
 impl Default for Config {
@@ -49,6 +51,7 @@ impl Default for Config {
             ui_mode: "tui".into(),
             ctl_timeout: 0,
             ctl_model: std::collections::HashMap::new(),
+            ctl_history: true,
         }
     }
 }
@@ -82,6 +85,7 @@ impl Config {
                 "agy_model" if !v.is_empty() => c.agy_model = v.into(),
                 "ui_mode" if !v.is_empty() => c.ui_mode = v.into(),
                 "ctl_timeout" => c.ctl_timeout = v.parse().unwrap_or(0),
+                "ctl_history" => c.ctl_history = v != "false",
                 k if k.starts_with("ctl_model_") && !v.is_empty() => {
                     if let Some(agent) = crate::ctl::normalize(&k["ctl_model_".len()..]) { c.ctl_model.insert(agent.into(), v.into()); }
                 }
@@ -108,6 +112,8 @@ ctl_timeout = 0
 # ctl_model_codex = "sol"
 # ctl_model_claude = "opus"
 # ctl_model_agy = "gemini-3.8-flash-high"
+# 요청·답 기록(~/.multi-ai-cli/ctl_history.jsonl). `mai ctl history` 로 본다.
+ctl_history = true
 "#;
 
 #[cfg(test)]
@@ -121,7 +127,8 @@ mod config_tests {
         assert_eq!(c.ctl_model.get("agy").map(String::as_str), Some("flash"));
         assert!(c.ctl_model.get("claude").is_none()); assert_eq!(c.ctl_model.len(), 2);
         let d = Config::parse(super::DEFAULT_CONFIG);
-        assert_eq!(d.ctl_timeout, 0); assert!(d.ctl_model.is_empty()); assert_eq!(d.agy_model, "gemini-3.1-pro-high");
+        assert_eq!(d.ctl_timeout, 0); assert!(d.ctl_model.is_empty()); assert!(d.ctl_history);
+        assert!(!Config::parse("ctl_history = false").ctl_history); assert_eq!(d.agy_model, "gemini-3.1-pro-high");
     }
 }
 

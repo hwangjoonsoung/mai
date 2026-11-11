@@ -76,6 +76,7 @@ struct Ask {
 #[cfg(unix)]
 struct AskGroup {
     id: u64, requester: u64, targets: Vec<crate::ctl::Target>,
+    question: String, requester_title: String, cwd: PathBuf,
     /// 답을 받은 뒤에도 검증 칸을 남겨 둔다(`--keep`). 기본은 1회성이라 닫는다.
     keep: bool,
     started: Instant,
@@ -1374,7 +1375,7 @@ impl App {
             asks.push(Ask { group: group_id, verifier: self.sessions[v].id, target: target.clone(), baseline, injected_at: None, deadline });
         }
         self.asks.extend(asks);
-        self.groups.push(AskGroup { id: group_id, requester: req.pane, targets, keep: req.keep, started: Instant::now(), results: Vec::new(), waiters: vec![stream] });
+        self.groups.push(AskGroup { id: group_id, requester: req.pane, targets, question: req.question.clone(), requester_title: title.clone(), cwd: cwd.clone(), keep: req.keep, started: Instant::now(), results: Vec::new(), waiters: vec![stream] });
         Ok(())
     }
 
@@ -1440,6 +1441,11 @@ impl App {
             g.results.sort_by_key(|(t, _)| g.targets.iter().position(|x| x == t).unwrap_or(usize::MAX));
             let response = crate::ctl::combine(&g.results);
             for stream in g.waiters { crate::ctl::server::reply(stream, &response); }
+            if self.config.ctl_history {
+                let (id, time) = crate::ctl::history::now_id();
+                let results = g.results.iter().map(|(t, r)| crate::ctl::history::Outcome { agent: t.agent.clone(), model: t.model.clone(), ok: r.ok, answer: r.answer.clone(), error: r.error.clone(), origin: r.origin.clone() }).collect();
+                crate::ctl::history::append(&crate::ctl::history::Record { id, time, cwd: g.cwd.to_string_lossy().into_owned(), requester: g.requester_title, question: g.question, elapsed_secs: g.started.elapsed().as_secs(), keep: g.keep, results });
+            }
         }
     }
 }

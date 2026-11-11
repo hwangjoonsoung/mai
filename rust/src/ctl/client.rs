@@ -1,7 +1,7 @@
 use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 
-const USAGE: &str = "사용법: mai ctl ask <에이전트[:모델][,에이전트...]> <질문|-> [--timeout|-t 초] [--keep|-k] [--model|-m 이름]  (옵션 위치는 자유)\n      mai ctl status | mai ctl screen <칸 id> | mai ctl model <에이전트> <별칭> | mai ctl instructions";
+const USAGE: &str = "사용법: mai ctl ask <에이전트[:모델][,에이전트...]> <질문|-> [--timeout|-t 초] [--keep|-k] [--model|-m 이름]  (옵션 위치는 자유)\n      mai ctl status | mai ctl screen <칸 id> | mai ctl history [건수|id] | mai ctl model <에이전트> <별칭> | mai ctl instructions";
 
 pub fn run(args: &[String]) -> i32 {
     match execute(args) {

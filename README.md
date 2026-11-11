@@ -439,6 +439,7 @@ mai ctl ask --timeout 600 Claude "이 답변을 검증해줘"
 printf '%s' '긴 질문' | mai ctl ask Gemini -
 mai ctl status                                      # 칸 목록 · 진행 중 요청 · 경과 시간
 mai ctl screen 3                                    # 칸 3 의 화면 글자 (디버깅)
+mai ctl history                                     # 최근 요청 10건. `history 50` · `history <id>` 로 전문
 mai ctl instructions
 ```
 
@@ -448,7 +449,11 @@ mai ctl instructions
 ctl_timeout = 600            # 초. 0 이면 무제한
 ctl_model_codex = "sol"      # -m 을 생략했을 때. 계열 이름이면 최신 버전
 ctl_model_claude = "opus"
+ctl_history = true           # 요청·답을 ~/.multi-ai-cli/ctl_history.jsonl 에 남긴다
 ```
+
+기록은 요청 1건이 JSONL 한 줄이다(시각 · 경로 · 요청자 · 질문 · 대상별 답/오류 · 소요 시간).
+`mai ctl history` 는 파일만 읽으므로 mai 밖에서도 된다.
 
 여러 대상은 `에이전트[:모델]` 을 쉼표로 잇는다. 동시에 묻고, 전부 끝나면
 `## Codex(sol)` 같은 머리말로 나눠 요청한 순서대로 합친다. 일부가 실패하면
