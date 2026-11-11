@@ -65,6 +65,11 @@ impl State {
 }
 
 pub struct Session {
+    pub id: u64,
+    pub verifier_of: Option<u64>,
+    /// 검증 칸을 띄울 때 넘긴 모델. 같은 요청자라도 모델이 다르면 다른 칸이다.
+    pub model: Option<String>,
+    pub spawned_at: Option<std::time::SystemTime>,
     pub agent_id: String,
     pub title: String,
     /// 어느 공간에 속하는가 (spaces 인덱스)
@@ -101,6 +106,10 @@ pub struct Session {
 impl Session {
     pub fn new(agent_id: &str, title: &str, space: usize) -> Self {
         Self {
+            id: 0,
+            verifier_of: None,
+            model: None,
+            spawned_at: None,
             agent_id: agent_id.into(),
             title: title.into(),
             space,

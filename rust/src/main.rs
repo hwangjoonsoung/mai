@@ -28,6 +28,7 @@ mod pty;
 mod relay;
 mod trust;
 mod vtscreen;
+mod ctl;
 
 use anyhow::Result;
 use app::{App, Hit, Mode};
@@ -67,6 +68,7 @@ macro_rules! outln {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("ctl") => std::process::exit(ctl::run(&args[1..])),
         Some("--selftest") => return selftest(),
         Some("--probe") => return probe(),
         Some("--complete") => {

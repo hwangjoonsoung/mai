@@ -43,13 +43,20 @@ impl PtySession {
     pub fn spawn_in(agent: &str, rows: u16, cols: u16, cwd: &std::path::Path) -> Result<Self> {
         let (exe, prefix) = resolve_agent(agent)
             .ok_or_else(|| anyhow!("실행 파일을 찾지 못했다: {agent}"))?;
-        Self::spawn_exe(exe, prefix, rows, cols, cwd, false)
+        Self::spawn_exe(exe, prefix, rows, cols, cwd, false, &[])
     }
 
     /// 사용자의 셸을 그 공간의 경로에서 띄운다.
     pub fn spawn_shell_in(rows: u16, cols: u16, cwd: &std::path::Path) -> Result<Self> {
         let (exe, prefix) = resolve_shell().ok_or_else(|| anyhow!("셸을 찾지 못했다"))?;
-        Self::spawn_exe(exe, prefix, rows, cols, cwd, true)
+        Self::spawn_exe(exe, prefix, rows, cols, cwd, true, &[])
+    }
+
+    /// `extra` 는 에이전트 실행 파일 뒤에 붙는 추가 인자(예: `--model`).
+    pub fn spawn_controlled(agent: Option<&str>, rows: u16, cols: u16, cwd: &std::path::Path, env: &[(&str, std::ffi::OsString)], extra: &[String]) -> Result<Self> {
+        let (exe, mut prefix) = match agent { Some(a) => resolve_agent(a), None => resolve_shell() }.ok_or_else(|| anyhow!("실행 파일을 찾지 못했다"))?;
+        prefix.extend(extra.iter().cloned());
+        Self::spawn_exe(exe, prefix, rows, cols, cwd, agent.is_none(), env)
     }
 
     fn spawn_exe(
@@ -59,6 +66,7 @@ impl PtySession {
         cols: u16,
         cwd: &std::path::Path,
         shell: bool,
+        env: &[(&str, std::ffi::OsString)],
     ) -> Result<Self> {
 
         let pty = portable_pty::native_pty_system();
@@ -76,6 +84,7 @@ impl PtySession {
             cmd.arg(a);
         }
         cmd.cwd(cwd);
+        for (key, value) in env { cmd.env(key, value); }
         // Claude Code 세션 식별 변수를 물려주지 않는다. 중첩 실행 시 혼동을 막는다.
         for k in ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_SESSION_ID"] {
             cmd.env_remove(k);

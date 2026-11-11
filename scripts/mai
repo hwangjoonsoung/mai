@@ -35,11 +35,14 @@ workspace=""
 # 예전엔 «옵션이 아닌 첫 인자» 를 공간 경로로 봤다. 그러면 인자를 받는
 # 하위 명령이 깨진다 — `mai --quote claude` 의 claude 가 경로로 잡혀
 # `cd claude` 로 죽었다. 경로를 주는 것은 첫 자리뿐이라는 규칙이 더 단순하다.
-if [[ $# -gt 0 && "$1" != -* ]]; then
+if [[ $# -gt 0 && "$1" != -* && "$1" != ctl ]]; then
     workspace="$1"
     shift
 fi
 
+if [[ "${1:-}" == ctl ]]; then
+    args=("$@")
+else
 for a in "$@"; do
     case "$a" in
         --rebuild) rebuild=1 ;;
@@ -47,6 +50,7 @@ for a in "$@"; do
         *) args+=("$a") ;;
     esac
 done
+fi
 
 bin="$root/rust/target/release/multi_ai_cli"
 [[ -x "$root/rust/target/debug/multi_ai_cli" && ! -x "$bin" ]] && bin="$root/rust/target/debug/multi_ai_cli"

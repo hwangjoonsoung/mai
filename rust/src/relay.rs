@@ -55,8 +55,8 @@ const MAX_CHARS: usize = 20_000;
 /// `agent_id` 칸의 마지막 답변을 찾는다. 못 찾으면 None.
 pub fn last_answer(agent_id: &str, cwd: &Path) -> Option<Quote> {
     let text = match agent_id {
-        "claude" => claude_last(cwd),
-        "codex" => codex_last(cwd),
+        "claude" => claude_last(cwd, None),
+        "codex" => codex_last(cwd, None),
         // agy 는 기록 위치가 아직 확인되지 않았다. 화면으로 떨어진다.
         _ => None,
     }?;
@@ -106,9 +106,12 @@ pub fn compose(source: &str, quote: &Quote, sentence: &str) -> String {
 /// 디렉터리 이름은 경로에서 **영숫자와 하이픈이 아닌 문자를 전부 `-` 로** 바꾼
 /// 것이다(실측: `/Users/hj/intelliJ/multi_ai_x` → `-Users-hj-intelliJ-multi-ai-x`,
 /// `~/.claude/skills` → `-Users-hj--claude-skills`).
-fn claude_last(cwd: &Path) -> Option<String> {
+fn claude_last(cwd: &Path, since: Option<std::time::SystemTime>) -> Option<String> {
     let dir = home()?.join(".claude").join("projects").join(escape(cwd));
-    let file = newest(&dir, "jsonl")?;
+    let file = if since.is_none() { newest(&dir, "jsonl")? } else {
+        let mut files = Vec::new(); collect(&dir, "jsonl", 1, &mut files);
+        files.into_iter().filter(|(p, _)| created_since(p, since)).max_by_key(|(_, m)| *m)?.0
+    };
     let text = fs::read_to_string(file).ok()?;
 
     let mut last = None;
@@ -135,7 +138,7 @@ fn claude_last(cwd: &Path) -> Option<String> {
 ///
 /// 경로에 cwd 가 없다. 첫 줄의 `session_meta` 가 `cwd` 를 들고 있어 그걸로
 /// 가른다. 첫 줄만 읽으므로 후보가 많아도 싸다.
-fn codex_last(cwd: &Path) -> Option<String> {
+fn codex_last(cwd: &Path, since: Option<std::time::SystemTime>) -> Option<String> {
     let root = home()?.join(".codex").join("sessions");
     let mut files = Vec::new();
     collect(&root, "jsonl", 5, &mut files);
@@ -145,7 +148,7 @@ fn codex_last(cwd: &Path) -> Option<String> {
         // **첫 줄만 읽어 거른다.** 전부 읽어 놓고 버리면 세션 기록 전체를
         // 훑게 된다 — 실측으로 358개 220MB 였다. 이건 키를 누른 순간 도는
         // 코드라 그 비용을 낼 수 없다.
-        if !first_line_cwd_matches(&path, cwd) {
+        if !created_since(&path, since) || !first_line_cwd_matches(&path, cwd) {
             continue;
         }
         let Ok(text) = fs::read_to_string(&path) else { continue };
@@ -288,4 +291,12 @@ mod tests {
         .unwrap();
         assert_eq!(join_text(Some(&v), "text", "text"), "앞\n뒤");
     }
+}
+
+fn created_since(path: &Path, since: Option<std::time::SystemTime>) -> bool {
+    since.map_or(true, |t| fs::metadata(path).and_then(|m| m.created()).is_ok_and(|c| c >= t))
+}
+pub fn last_answer_since(agent: &str, cwd: &Path, since: Option<std::time::SystemTime>) -> Option<Quote> {
+    let text = match agent { "claude" => claude_last(cwd, since), "codex" => codex_last(cwd, since), _ => None }?;
+    Some(clamp(text, Origin::Session))
 }

@@ -31,6 +31,10 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 anyhow = "1"
 
+# 제어 소켓 정리 — 시그널 핸들러에서 unlink/rmdir, 죽은 pid 판별(kill 0)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 
 [profile.release]

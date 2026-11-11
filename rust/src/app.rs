@@ -67,7 +67,19 @@ pub enum Hit {
     Tab(usize),
 }
 
+#[cfg(unix)]
+struct Ask {
+    requester: u64, verifier: u64, agent: String, baseline: Option<String>,
+    injected_at: Option<Instant>, deadline: Option<Instant>,
+    /// 답을 받은 뒤에도 검증 칸을 남겨 둔다(`--keep`). 기본은 1회성이라 닫는다.
+    keep: bool,
+    waiters: Vec<std::os::unix::net::UnixStream>,
+}
 pub struct App {
+    next_id: u64,
+    #[cfg(unix)] ctl: Option<crate::ctl::server::Server>,
+    #[cfg(unix)] asks: Vec<Ask>,
+    #[cfg(unix)] asks_checked: Instant,
     pub spaces: Vec<Space>,
     pub active_space: usize,
     pub sessions: Vec<Session>,
@@ -126,6 +138,10 @@ impl App {
     pub fn new() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
+            next_id: 1,
+            #[cfg(unix)] ctl: None,
+            #[cfg(unix)] asks: Vec::new(),
+            #[cfg(unix)] asks_checked: Instant::now(),
             spaces: vec![Space::new(cwd)],
             active_space: 0,
             sessions: Vec::new(),
@@ -203,6 +219,10 @@ impl App {
     /// 터미널을 기본으로 두는 이유는, 무엇을 붙일지 정하기 전에도 그 경로에서
     /// 뭔가는 해 보게 되기 때문이다.
     pub fn bootstrap(&mut self, area: Rect) {
+        #[cfg(unix)]
+        if self.ctl.is_none() {
+            match crate::ctl::server::Server::start() { Ok(server) => self.ctl = Some(server), Err(e) => self.status = format!("제어 소켓 기동 실패: {e}") }
+        }
         self.spawn_terminal(area);
         self.sync_sizes(area);
         self.focus = self.visible().first().copied().unwrap_or(0);
@@ -271,7 +291,11 @@ impl App {
         };
 
         let mut sess = Session::terminal(&title, self.active_space);
-        match PtySession::spawn_shell_in(h, w, &cwd) {
+        sess.id = self.next_id;
+        self.next_id += 1;
+        sess.cwd = Some(cwd.clone());
+        let env = self.control_env(sess.id, "main");
+        match PtySession::spawn_controlled(None, h, w, &cwd, &env, &[]) {
             Ok(pty) => {
                 sess.pty = Some(pty);
                 sess.size = (h, w);
@@ -371,6 +395,7 @@ impl App {
     /// 살아 있는 세션의 출력을 먹이고, 준비된 세션에 프롬프트를 넣는다.
     pub fn tick(&mut self) {
         self.follow_cwd();
+        #[cfg(unix)] self.receive_asks();
         for s in self.sessions.iter_mut() {
             let before = s.pty.as_ref().map(|p| p.rx_bytes).unwrap_or(0);
             if let Some(p) = s.pty.as_mut() {
@@ -401,6 +426,7 @@ impl App {
                 }
             }
         }
+        #[cfg(unix)] self.finish_asks();
     }
 
     /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다.
@@ -1230,7 +1256,7 @@ mod tests {
 
     #[test]
     fn 새_공간_경로에_verbatim_이_남지_않는다() {
-        let mut app = App::new(&[("claude", "Claude")]);
+        let mut app = App::new();
         app.add_space(".").expect("현재 디렉터리는 공간이 된다");
         let p = app.active_path().to_string_lossy().into_owned();
         assert!(!p.starts_with(r"\\?\"), "verbatim 이 남았다: {p}");
@@ -1244,5 +1270,91 @@ mod tests {
         assert_eq!(common_prefix(&v(&["abc", "xyz"])), "");
         // 대소문자를 가리지 않는다.
         assert_eq!(common_prefix(&v(&["Desktop", "desktop2"])), "Desktop");
+    }
+}
+
+impl App {
+    pub fn by_id(&self, id: u64) -> Option<usize> { self.sessions.iter().position(|s| s.id == id) }
+    fn control_env(&self, id: u64, role: &str) -> Vec<(&'static str, std::ffi::OsString)> {
+        let mut env = vec![("MAI_PANE", id.to_string().into()), ("MAI_ROLE", role.into())];
+        #[cfg(unix)] if let Some(server) = &self.ctl { env.push(("MAI_CTL", server.path.as_os_str().to_owned())); }
+        env
+    }
+    #[cfg(unix)]
+    fn receive_asks(&mut self) {
+        loop {
+            let Some((req, stream)) = self.ctl.as_ref().and_then(|s| s.rx.try_recv().ok()) else { break };
+            if let Err((stream, error)) = self.begin_ask(req, stream) { crate::ctl::server::reply(stream, &crate::ctl::Response::error(error)); }
+        }
+    }
+    #[cfg(unix)]
+    fn begin_ask(&mut self, req: crate::ctl::Request, stream: std::os::unix::net::UnixStream) -> Result<(), (std::os::unix::net::UnixStream, String)> {
+        let Some(i) = self.by_id(req.pane) else { return Err((stream, "요청자 칸이 없다".into())) };
+        if req.role == "verifier" || self.sessions[i].verifier_of.is_some() { return Err((stream, "검증자 칸에서는 다시 검증을 요청할 수 없다".into())); }
+        let Some(agent) = crate::ctl::normalize(&req.agent) else { return Err((stream, "알 수 없는 에이전트".into())) };
+        if req.op != "ask" || req.question.trim().is_empty() { return Err((stream, "잘못된 요청".into())); }
+        let deadline = match req.timeout_secs { Some(t) => match Instant::now().checked_add(Duration::from_secs(t)) { Some(d) => Some(d), None => return Err((stream, "시간 제한이 너무 크다".into())) }, None => None };
+        if let Some(ask) = self.asks.iter_mut().find(|a| a.requester == req.pane) {
+            if ask.agent != agent { return Err((stream, "이미 진행 중".into())); }
+            ask.keep |= req.keep; ask.waiters.push(stream); return Ok(());
+        }
+        let cwd = self.sessions[i].cwd.clone().unwrap_or_else(|| self.spaces[self.sessions[i].space].path.clone());
+        let title = self.sessions[i].title.clone(); let space = self.sessions[i].space;
+        // `-m sol` 같은 계열 이름은 그 CLI 의 최신 모델 이름으로 푼다.
+        let model = req.model.as_deref().map(|m| crate::ctl::models::resolve(agent, m));
+        let existing = self.sessions.iter().position(|s| s.verifier_of == Some(req.pane) && s.agent_id == agent && s.cwd.as_ref() == Some(&cwd) && s.model == model && s.pty.as_ref().is_some_and(|p| !p.finished()));
+        let v = if let Some(v) = existing { v } else {
+            let id = self.next_id; self.next_id += 1;
+            let env = self.control_env(id, "verifier");
+            let (h, w) = pane_size(self.last_area, (self.visible().len()+1).min(MAX_SPLIT));
+            let spawned_at = std::time::SystemTime::now();
+            // 세 CLI 모두 `--model <이름>` 을 받는다(claude · codex · agy).
+            let extra: Vec<String> = model.iter().flat_map(|m| ["--model".to_string(), m.clone()]).collect();
+            let pty = match PtySession::spawn_controlled(Some(agent), h, w, &cwd, &env, &extra) { Ok(p) => p, Err(e) => return Err((stream, e.to_string())) };
+            let display = crate::AGENTS.iter().find(|(a, _)| *a == agent).unwrap().1;
+            let label = match &model { Some(m) => format!("{display}({m}) ← {title}"), None => format!("{display} ← {title}") };
+            let mut session = Session::new(agent, &label, space);
+            session.id = id; session.verifier_of = Some(req.pane); session.model = model.clone(); session.spawned_at = Some(spawned_at);
+            session.cwd = Some(cwd.clone()); session.pty = Some(pty); session.size = (h,w); session.started = Some(Instant::now());
+            self.sessions.push(session); self.sessions.len()-1
+        };
+        let baseline = crate::relay::last_answer_since(agent, &cwd, self.sessions[v].spawned_at).map(|q| q.text);
+        self.sessions[v].pending = Some(format!("\x1b[200~[{title} 의 검증 요청]\n\"\"\"\n{}\n\"\"\"\x1b[201~", req.question));
+        self.sessions[v].user_typed = false;
+        self.asks.push(Ask { requester: req.pane, verifier: self.sessions[v].id, agent: agent.into(), baseline, injected_at: None, deadline, keep: req.keep, waiters: vec![stream] });
+        Ok(())
+    }
+    #[cfg(unix)]
+    fn finish_asks(&mut self) {
+        if self.asks_checked.elapsed() < Duration::from_millis(500) { return; }
+        self.asks_checked = Instant::now();
+        let asks = std::mem::take(&mut self.asks);
+        for mut ask in asks {
+            let result = if ask.deadline.is_some_and(|d| Instant::now() >= d) { Some(crate::ctl::Response::error("검증 시간 초과")) }
+            else if self.by_id(ask.requester).is_none() { Some(crate::ctl::Response::error("요청자 칸이 닫혔다")) }
+            else if let Some(v) = self.by_id(ask.verifier) {
+                let s = &mut self.sessions[v];
+                if s.pty.as_ref().map_or(true, |p| p.finished()) { Some(crate::ctl::Response::error("검증자 칸이 종료됐다")) }
+                else if s.pending.is_some() { self.status = "검증 칸의 준비 또는 사용자 확인을 기다린다".into(); None }
+                else {
+                    let injected = ask.injected_at.get_or_insert_with(Instant::now);
+                    let screen = s.pty.as_ref().unwrap().screen();
+                    if injected.elapsed() < Duration::from_millis(2500) || s.seen.1.elapsed() < Duration::from_millis(2500) || crate::modal::open(&screen) { None }
+                    else {
+                        let quote = if ask.agent == "agy" { Some(crate::relay::from_screen(&screen)) } else { crate::relay::last_answer_since(&ask.agent, s.cwd.as_ref().unwrap(), s.spawned_at) };
+                        quote.filter(|q| !q.text.trim().is_empty() && Some(&q.text) != ask.baseline.as_ref()).map(|q| crate::ctl::Response { ok: true, answer: Some(q.text), origin: Some(q.origin.label().into()), error: None })
+                    }
+                }
+            } else { Some(crate::ctl::Response::error("검증자 칸이 닫혔다")) };
+            if let Some(response) = result {
+                if !response.ok { if let Some(v) = self.by_id(ask.verifier) { self.sessions[v].pending = None; } }
+                for stream in ask.waiters { crate::ctl::server::reply(stream, &response); }
+                // 1회성 질문이면 답을 돌려준 뒤 검증 칸을 닫는다. 오류로 끝난 칸은
+                // 무슨 일이 있었는지 볼 수 있게 남긴다.
+                if response.ok && !ask.keep {
+                    if let Some(v) = self.by_id(ask.verifier) { self.close_session(v); self.status = "검증 칸을 닫았다".into(); }
+                }
+            } else { self.asks.push(ask); }
+        }
     }
 }

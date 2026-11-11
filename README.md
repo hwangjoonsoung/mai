@@ -412,3 +412,38 @@ Claude 대화창에 말로 요청한다** — `consolidate.md 대로 수렴해�
 - 2026-09-03 — 단일 파일 48,058자를 4개 문서로 분리, `INTENT.md` 신설
 - 2026-09-04 — Rust + PTY 로 재작성 결정 ([REBUILD.md](REBUILD.md))
 - 2026-09-05 — macOS 지원, `mai` 런처, 공간×칸 구조 정착, 답 넘기기, Windows 런처
+
+## AI 사이 검증 요청 (macOS / Unix)
+
+mai 안에서 실행하면 같은 공간·경로에 검증 칸을 열고 답을 stdout으로 돌려준다.
+포커스는 유지한다. 검증 칸은 **답을 돌려준 뒤 자동으로 닫힌다** — 1회성 질문이
+기본이다. `--keep` 을 주면 칸을 남겨 두고 같은 요청자의 다음 요청에 재사용한다.
+오류(시간 초과 등)로 끝난 칸은 무슨 일이 있었는지 볼 수 있게 남긴다.
+`--model`(`-m`)은 검증 칸을 띄울 때 그 CLI 의 `--model` 로 넘긴다.
+codex 는 `sol` · `astra` · `terra` 처럼 **계열 이름만 주면** `~/.codex/models_cache.json`
+에서 그 계열의 가장 최신 버전(`gpt-6.1-sol` 등)을 골라 넘긴다. claude 는 CLI 가
+별칭(`opus` 등)을 직접 받고, agy 는 준 이름 그대로 넘긴다(`agy models` 로 확인).
+어떤 이름으로 넘어가는지는 `mai ctl model codex sol` 로 미리 본다.
+같은 요청자라도 (푼 뒤의) 모델이 다르면 다른 칸이다.
+
+```sh
+mai ctl ask codex "이 구현을 검증해줘"              # 답 받으면 칸을 닫는다
+mai ctl ask -k codex "이어서 물어볼 거야"            # --keep: 칸을 남긴다
+mai ctl ask codex -m sol "모델을 골라 묻는다"        # --model. 계열 이름이면 최신 버전. 옵션 위치는 자유
+mai ctl model codex sol                             # → gpt-6.1-sol 처럼 풀린 이름
+mai ctl ask --timeout 600 Claude "이 답변을 검증해줘"
+printf '%s' '긴 질문' | mai ctl ask Gemini -
+mai ctl instructions
+```
+
+기본 대기는 무제한이다. 성공은 종료 코드 0, 서버·통신 오류는 1,
+잘못된 사용법과 mai 밖 실행은 2다. 신뢰 대화상자는 사용자가 확인한다.
+검증자는 재검증을 요청할 수 없다. 동일 요청자의 같은 대상 진행 중 요청은
+합쳐지므로 다른 질문도 앞 요청이 끝난 뒤 보낸다. Gemini는 화면 내용을 반환한다.
+Windows 제어 통로는 아직 지원하지 않는다.
+
+실제 CLI의 응답 종료 판정, 동시에 시작한 동일 에이전트의 기록 구분,
+macOS 샌드박스의 소켓 연결은 수동 확인이 필요하다.
+`cd rust && cargo test` 후 저장소의 `./scripts/mai`로 실행하고,
+열린 셸에서 `mai ctl ask codex "1+1은?"`로 응답과 칸 자동 닫힘을,
+`mai ctl ask --keep codex "1+1은?"`를 두 번 순서대로 실행해 검증 칸 재사용을 확인한다.
