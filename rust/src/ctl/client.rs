@@ -1,5 +1,6 @@
 use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
+use super::transport::Endpoint;
 
 const USAGE: &str = "사용법: mai ctl ask <에이전트[:모델][,에이전트...]> <질문|-> [--timeout|-t 초] [--keep|-k] [--model|-m 이름]  (옵션 위치는 자유)\n      mai ctl status | mai ctl screen <칸 id> | mai ctl history [건수|id] | mai ctl model <에이전트> <별칭> | mai ctl instructions";
 
@@ -17,13 +18,13 @@ fn execute(args: &[String]) -> Result<String, Failure> {
     match args.first().map(String::as_str) {
         Some("ask") => ask(args),
         Some("status") if args.len() == 1 => {
-            let r = send(&Request { op: "status".into(), pane: pane_env().unwrap_or(0), role: role_env(), agent: String::new(), question: String::new(), timeout_secs: None, keep: false, model: None, targets: vec![], target_pane: None })?;
+            let r = send(&Request { op: "status".into(), pane: pane_env().unwrap_or(0), role: role_env(), agent: String::new(), question: String::new(), timeout_secs: None, keep: false, model: None, targets: vec![], target_pane: None, token: None })?;
             let status: Status = serde_json::from_str(r.answer.as_deref().unwrap_or("")).map_err(|e| (1, e.to_string(), None))?;
             Ok(render_status(&status))
         }
         Some("screen") if args.len() == 2 => {
             let id = args[1].parse().map_err(|_| bad())?;
-            send(&Request { op: "screen".into(), pane: pane_env().unwrap_or(0), role: role_env(), agent: String::new(), question: String::new(), timeout_secs: None, keep: false, model: None, targets: vec![], target_pane: Some(id) }).map(|r| r.answer.unwrap_or_default())
+            send(&Request { op: "screen".into(), pane: pane_env().unwrap_or(0), role: role_env(), agent: String::new(), question: String::new(), timeout_secs: None, keep: false, model: None, targets: vec![], target_pane: Some(id), token: None }).map(|r| r.answer.unwrap_or_default())
         }
         _ => Err(bad()),
     }
@@ -52,7 +53,7 @@ fn ask(args: &[String]) -> Result<String, Failure> {
     if question == "-" { question.clear(); std::io::stdin().read_to_string(&mut question).map_err(|e| (2, e.to_string(), None))?; }
     if question.trim().is_empty() { return Err(bad()); }
     let first = targets[0].clone();
-    let req = Request { op: "ask".into(), pane, role: role_env(), agent: first.agent, question, timeout_secs: timeout, keep, model: first.model, targets, target_pane: None };
+    let req = Request { op: "ask".into(), pane, role: role_env(), agent: first.agent, question, timeout_secs: timeout, keep, model: first.model, targets, target_pane: None, token: None };
     let response = send(&req)?;
     // 성공하면 칸별 마커를 남긴다. hooks/mai-verify-stop.py 가 «이번 턴에 검증했는가» 를 이걸로 본다.
     if response.ok { touch_verified(pane); }
@@ -63,8 +64,10 @@ fn ask(args: &[String]) -> Result<String, Failure> {
 
 /// `<MAI_CTL 디렉터리>/verified-<pane>` 의 mtime 을 지금으로. 실패해도 조용히.
 fn touch_verified(pane: u64) {
-    let Some(ctl) = std::env::var_os("MAI_CTL") else { return };
-    let Some(dir) = std::path::Path::new(&ctl).parent() else { return };
+    let dir = match std::env::var_os("MAI_CTL_DIR") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => match std::env::var_os("MAI_CTL").and_then(|c| std::path::Path::new(&c).parent().map(|p| p.to_path_buf())) { Some(d) => d, None => return },
+    };
     let _ = std::fs::write(dir.join(format!("verified-{pane}")), b"");
 }
 
@@ -72,13 +75,19 @@ fn pane_env() -> Option<u64> { std::env::var("MAI_PANE").ok().and_then(|s| s.par
 fn role_env() -> String { std::env::var("MAI_ROLE").unwrap_or_else(|_| "main".into()) }
 
 fn send(req: &Request) -> Result<Response, Failure> {
-    let path = std::env::var_os("MAI_CTL").ok_or((2, "mai 안에서 실행해야 한다".into(), None))?;
-    let mut stream = std::os::unix::net::UnixStream::connect(path).map_err(|e| (1, e.to_string(), None))?;
-    let bytes = serde_json::to_string(req).map_err(|e| (2, e.to_string(), None))?;
+    let endpoint = Endpoint::from_env().ok_or((2, "mai 안에서 실행해야 한다".into(), None))?;
+    let mut stream = endpoint.connect().map_err(|e| (1, e.to_string(), None))?;
+    let mut req = Request { token: endpoint.token().map(str::to_string), ..clone_request(req) };
+    if req.token.as_deref() == Some("") { req.token = None; }
+    let bytes = serde_json::to_string(&req).map_err(|e| (2, e.to_string(), None))?;
     writeln!(stream, "{bytes}").map_err(|e| (1, e.to_string(), None))?;
     let mut line = String::new(); BufReader::new(stream).read_line(&mut line).map_err(|e| (1, e.to_string(), None))?;
     let response: Response = serde_json::from_str(&line).map_err(|e| (1, e.to_string(), None))?;
     if response.ok || req.op == "ask" { Ok(response) } else { Err((1, response.error.unwrap_or_else(|| "실패".into()), None)) }
+}
+
+fn clone_request(r: &Request) -> Request {
+    Request { op: r.op.clone(), pane: r.pane, role: r.role.clone(), agent: r.agent.clone(), question: r.question.clone(), timeout_secs: r.timeout_secs, keep: r.keep, model: r.model.clone(), targets: r.targets.clone(), target_pane: r.target_pane, token: r.token.clone() }
 }
 
 fn render_status(s: &Status) -> String {

@@ -10,7 +10,7 @@ prompts/verify.md 는 «답변 초안이나 구현이 준비되면 mai ctl ask �
   - 이번 턴(마지막 사용자 프롬프트 이후)에 파일 편집이 없고 마지막 답도 짧으면
     잡담으로 보고 막지 않는다.
   - 그 밖에는 `mai ctl ask` 가 성공할 때 남기는 마커
-    (<MAI_CTL 디렉터리>/verified-<MAI_PANE>) 가 이번 턴 안에 갱신됐어야 한다.
+    (<MAI_CTL_DIR>/verified-<MAI_PANE>) 가 이번 턴 안에 갱신됐어야 한다.
     아니면 {"decision":"block","reason":…} 으로 막는다.
 
 mai ctl ask 가 0 이 아닌 코드로 끝나면 마커를 남기지 않으므로, 그때는 지침대로
@@ -42,7 +42,7 @@ def main():
         return allow()
     if not edited and last_len < LONG_ANSWER:
         return allow()
-    marker = os.path.join(os.path.dirname(ctl), f"verified-{pane}")
+    marker = os.path.join(os.environ.get("MAI_CTL_DIR") or os.path.dirname(ctl), f"verified-{pane}")
     try:
         if os.path.getmtime(marker) >= prompt_at:
             return allow()

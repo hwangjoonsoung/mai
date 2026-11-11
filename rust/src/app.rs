@@ -67,13 +67,11 @@ pub enum Hit {
     Tab(usize),
 }
 
-#[cfg(unix)]
 struct Ask {
     group: u64, verifier: u64, target: crate::ctl::Target, baseline: Option<String>,
     injected_at: Option<Instant>, deadline: Option<Instant>,
 }
 /// 한 번의 `mai ctl ask` — 대상이 여럿이면 답을 모아 한 번에 돌려준다.
-#[cfg(unix)]
 struct AskGroup {
     id: u64, requester: u64, targets: Vec<crate::ctl::Target>,
     question: String, requester_title: String, cwd: PathBuf,
@@ -81,14 +79,14 @@ struct AskGroup {
     keep: bool,
     started: Instant,
     results: Vec<(crate::ctl::Target, crate::ctl::Response)>,
-    waiters: Vec<std::os::unix::net::UnixStream>,
+    waiters: Vec<Box<dyn crate::ctl::transport::Conn>>,
 }
 pub struct App {
     next_id: u64,
-    #[cfg(unix)] ctl: Option<crate::ctl::server::Server>,
-    #[cfg(unix)] asks: Vec<Ask>,
-    #[cfg(unix)] groups: Vec<AskGroup>,
-    #[cfg(unix)] asks_checked: Instant,
+    ctl: Option<crate::ctl::server::Server>,
+    asks: Vec<Ask>,
+    groups: Vec<AskGroup>,
+    asks_checked: Instant,
     /// ~/.multi-ai-cli/config.toml. bootstrap 에서 읽는다.
     config: crate::room::Config,
     pub spaces: Vec<Space>,
@@ -150,10 +148,10 @@ impl App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             next_id: 1,
-            #[cfg(unix)] ctl: None,
-            #[cfg(unix)] asks: Vec::new(),
-            #[cfg(unix)] groups: Vec::new(),
-            #[cfg(unix)] asks_checked: Instant::now(),
+            ctl: None,
+            asks: Vec::new(),
+            groups: Vec::new(),
+            asks_checked: Instant::now(),
             config: crate::room::Config::default(),
             spaces: vec![Space::new(cwd)],
             active_space: 0,
@@ -234,7 +232,6 @@ impl App {
     pub fn bootstrap(&mut self, area: Rect) {
         self.config = crate::room::Config::load();
         crate::ctl::models::warm_agy_cache();
-        #[cfg(unix)]
         if self.ctl.is_none() {
             match crate::ctl::server::Server::start() { Ok(server) => self.ctl = Some(server), Err(e) => self.status = format!("제어 소켓 기동 실패: {e}") }
         }
@@ -410,7 +407,7 @@ impl App {
     /// 살아 있는 세션의 출력을 먹이고, 준비된 세션에 프롬프트를 넣는다.
     pub fn tick(&mut self) {
         self.follow_cwd();
-        #[cfg(unix)] self.receive_asks();
+        self.receive_asks();
         for s in self.sessions.iter_mut() {
             let before = s.pty.as_ref().map(|p| p.rx_bytes).unwrap_or(0);
             if let Some(p) = s.pty.as_mut() {
@@ -441,7 +438,7 @@ impl App {
                 }
             }
         }
-        #[cfg(unix)] self.finish_asks();
+        self.finish_asks();
     }
 
     /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다.
@@ -1292,11 +1289,15 @@ impl App {
     pub fn by_id(&self, id: u64) -> Option<usize> { self.sessions.iter().position(|s| s.id == id) }
     fn control_env(&self, id: u64, role: &str) -> Vec<(&'static str, std::ffi::OsString)> {
         let mut env = vec![("MAI_PANE", id.to_string().into()), ("MAI_ROLE", role.into())];
-        #[cfg(unix)] if let Some(server) = &self.ctl { env.push(("MAI_CTL", server.path.as_os_str().to_owned())); }
+        crate::ctl::server::note_pane(id);
+        if let Some(server) = &self.ctl {
+            env.push(("MAI_CTL", server.endpoint.env_value()));
+            env.push(("MAI_CTL_DIR", server.dir.as_os_str().to_owned()));
+            if let Some(t) = server.endpoint.token() { env.push(("MAI_CTL_TOKEN", t.into())); }
+        }
         env
     }
 
-    #[cfg(unix)]
     fn receive_asks(&mut self) {
         loop {
             let Some((req, stream)) = self.ctl.as_ref().and_then(|s| s.rx.try_recv().ok()) else { break };
@@ -1311,7 +1312,6 @@ impl App {
     }
 
     /// `mai ctl status` — 칸 목록과 진행 중 요청.
-    #[cfg(unix)]
     fn status(&self) -> crate::ctl::Status {
         let panes = self.sessions.iter().map(|s| crate::ctl::PaneStatus {
             id: s.id, title: s.title.clone(), agent: s.agent_id.clone(),
@@ -1333,7 +1333,6 @@ impl App {
     }
 
     /// `mai ctl screen <id>` — 그 칸의 화면 글자. 디버깅용.
-    #[cfg(unix)]
     fn screen_of(&self, id: Option<u64>) -> crate::ctl::Response {
         let Some(i) = id.and_then(|id| self.by_id(id)) else { return crate::ctl::Response::error("그런 칸이 없다") };
         match self.sessions[i].pty.as_ref() {
@@ -1342,8 +1341,7 @@ impl App {
         }
     }
 
-    #[cfg(unix)]
-    fn begin_ask(&mut self, req: crate::ctl::Request, stream: std::os::unix::net::UnixStream) -> Result<(), (std::os::unix::net::UnixStream, crate::ctl::Response)> {
+    fn begin_ask(&mut self, req: crate::ctl::Request, stream: Box<dyn crate::ctl::transport::Conn>) -> Result<(), (Box<dyn crate::ctl::transport::Conn>, crate::ctl::Response)> {
         let fail = |stream, msg: &str| Err((stream, crate::ctl::Response::error(msg)));
         let Some(i) = self.by_id(req.pane) else { return fail(stream, "요청자 칸이 없다") };
         if req.role == "verifier" || self.sessions[i].verifier_of.is_some() { return fail(stream, "검증자 칸에서는 다시 검증을 요청할 수 없다"); }
@@ -1380,7 +1378,6 @@ impl App {
     }
 
     /// 대상에 맞는 검증 칸을 찾거나 새로 띄운다. 반환은 sessions 인덱스.
-    #[cfg(unix)]
     fn verifier_pane(&mut self, requester: u64, target: &crate::ctl::Target, cwd: &PathBuf, title: &str, space: usize) -> Result<usize, String> {
         let agent = target.agent.as_str();
         let existing = self.sessions.iter().position(|s| s.verifier_of == Some(requester) && s.agent_id == agent && s.cwd.as_ref() == Some(cwd) && s.model == target.model && s.pending.is_none() && s.pty.as_ref().is_some_and(|p| !p.finished()));
@@ -1401,7 +1398,6 @@ impl App {
         Ok(self.sessions.len() - 1)
     }
 
-    #[cfg(unix)]
     fn finish_asks(&mut self) {
         if self.asks_checked.elapsed() < Duration::from_millis(500) { return; }
         self.asks_checked = Instant::now();

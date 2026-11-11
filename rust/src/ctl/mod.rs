@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 pub mod models;
 pub mod history;
-#[cfg(unix)] pub mod server;
-#[cfg(unix)] mod client;
+pub mod transport;
+pub mod server;
+mod client;
 
 /// 질문을 받을 칸 하나. 에이전트와 (선택) 모델.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,8 @@ pub struct Request {
     #[serde(default, skip_serializing_if="Vec::is_empty")] pub targets: Vec<Target>,
     /// `screen` 이 볼 칸 id.
     #[serde(default, skip_serializing_if="Option::is_none")] pub target_pane: Option<u64>,
+    /// TCP 전송일 때의 인증 토큰(MAI_CTL_TOKEN).
+    #[serde(default, skip_serializing_if="Option::is_none")] pub token: Option<String>,
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Response { pub ok: bool, #[serde(skip_serializing_if="Option::is_none")] pub answer: Option<String>, #[serde(skip_serializing_if="Option::is_none")] pub origin: Option<String>, #[serde(skip_serializing_if="Option::is_none")] pub error: Option<String> }
@@ -90,14 +93,13 @@ pub fn run(args: &[String]) -> i32 {
         println!("{}", models::resolve_fetching(agent, alias)); return 0;
     }
     if args.first().map(String::as_str) == Some("history") { return history::run(&args[1..]); }
-    #[cfg(unix)] { client::run(args) }
-    #[cfg(not(unix))] { eprintln!("이 플랫폼에서는 mai ctl을 지원하지 않는다"); 2 }
+    client::run(args)
 }
 
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn protocol_roundtrip() {
-        let r = Request { op: "ask".into(), pane: 7, role: "main".into(), agent: "codex".into(), question: "질문\n두 줄".into(), timeout_secs: None, keep: true, model: Some("gpt-5".into()), targets: vec![], target_pane: None };
+        let r = Request { op: "ask".into(), pane: 7, role: "main".into(), agent: "codex".into(), question: "질문\n두 줄".into(), timeout_secs: None, keep: true, model: Some("gpt-5".into()), targets: vec![], target_pane: None, token: None };
         let decoded: Request = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(decoded.question, r.question); assert!(decoded.keep); assert_eq!(decoded.model.as_deref(), Some("gpt-5"));
         assert_eq!(decoded.targets(), vec![Target { agent: "codex".into(), model: Some("gpt-5".into()) }]);
