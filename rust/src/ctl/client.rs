@@ -54,9 +54,18 @@ fn ask(args: &[String]) -> Result<String, Failure> {
     let first = targets[0].clone();
     let req = Request { op: "ask".into(), pane, role: role_env(), agent: first.agent, question, timeout_secs: timeout, keep, model: first.model, targets, target_pane: None };
     let response = send(&req)?;
+    // 성공하면 칸별 마커를 남긴다. hooks/mai-verify-stop.py 가 «이번 턴에 검증했는가» 를 이걸로 본다.
+    if response.ok { touch_verified(pane); }
     // 여러 대상 중 일부만 실패하면 합친 답은 stdout 으로 주고, 실패 목록은 stderr · 종료 코드 1.
     if response.ok { response.answer.ok_or((1, "응답에 답이 없다".into(), None)) }
     else { Err((1, response.error.unwrap_or_else(|| "검증 실패".into()), response.answer)) }
+}
+
+/// `<MAI_CTL 디렉터리>/verified-<pane>` 의 mtime 을 지금으로. 실패해도 조용히.
+fn touch_verified(pane: u64) {
+    let Some(ctl) = std::env::var_os("MAI_CTL") else { return };
+    let Some(dir) = std::path::Path::new(&ctl).parent() else { return };
+    let _ = std::fs::write(dir.join(format!("verified-{pane}")), b"");
 }
 
 fn pane_env() -> Option<u64> { std::env::var("MAI_PANE").ok().and_then(|s| s.parse().ok()) }

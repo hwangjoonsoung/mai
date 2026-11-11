@@ -452,6 +452,16 @@ ctl_model_claude = "opus"
 ctl_history = true           # 요청·답을 ~/.multi-ai-cli/ctl_history.jsonl 에 남긴다
 ```
 
+### 검증을 잊지 않게 하는 훅 (Claude Code)
+
+`prompts/verify.md` 는 에이전트가 읽고 따르는 지침이라 잊을 수 있다. 이 저장소의
+`.claude/settings.json` 은 Stop 훅으로 `hooks/mai-verify-stop.py` 를 걸어, mai 칸 안의
+Claude Code 가 **이번 턴에 파일을 고쳤거나 긴 답을 썼는데 `mai ctl ask` 를 한 번도
+성공시키지 않았으면** 턴 종료를 한 번 막고 지침을 되짚어 준다. 판단 근거는 `mai ctl ask`
+가 성공할 때 남기는 `<소켓 디렉터리>/verified-<칸>` 마커의 시각이다. mai 밖, 검증자 칸,
+짧은 잡담 턴, 이미 한 번 막은 턴은 건드리지 않는다. 다른 저장소에서도 쓰려면 그
+두 파일을 복사한다. Codex · Gemini 의 훅은 아직 걸지 않았다.
+
 기록은 요청 1건이 JSONL 한 줄이다(시각 · 경로 · 요청자 · 질문 · 대상별 답/오류 · 소요 시간).
 `mai ctl history` 는 파일만 읽으므로 mai 밖에서도 된다.
 
