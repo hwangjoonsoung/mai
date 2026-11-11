@@ -28,11 +28,16 @@ pub struct Record {
 pub fn path() -> PathBuf { crate::room::home().join("ctl_history.jsonl") }
 
 /// 줄 하나를 덧붙인다. 실패해도 요청 자체는 이미 끝났으므로 조용히 넘어간다.
+///
+/// 본문과 개행을 **한 번의 write 로** 쓴다. `writeln!` 은 둘을 따로 쓰는데, 그 사이에
+/// 프로세스가 죽으면(답을 돌려준 직후 SIGTERM — 실측) 개행이 빠져 다음 기록과
+/// 한 줄에 붙는다.
 pub fn append(record: &Record) {
-    let Ok(line) = serde_json::to_string(record) else { return };
+    let Ok(mut line) = serde_json::to_string(record) else { return };
+    line.push('\n');
     let _ = std::fs::create_dir_all(crate::room::home());
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path()) { let _ = writeln!(f, "{line}"); }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path()) { let _ = f.write_all(line.as_bytes()); }
 }
 
 pub fn now_id() -> (u64, String) {
@@ -54,7 +59,18 @@ fn local_time(ms: u64) -> String { format!("@{}", ms / 1000) }
 
 pub fn read_all() -> Vec<Record> {
     let Ok(text) = std::fs::read_to_string(path()) else { return Vec::new() };
-    text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    parse_all(&text)
+}
+
+/// 줄마다 하나씩이지만, 개행이 빠져 한 줄에 여러 객체가 붙은 과거 기록도 읽는다.
+pub fn parse_all(text: &str) -> Vec<Record> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        for item in serde_json::Deserializer::from_str(line).into_iter::<Record>() {
+            match item { Ok(r) => out.push(r), Err(_) => break }
+        }
+    }
+    out
 }
 
 /// `mai ctl history [N | id]`. 인자가 없으면 최근 10건.
@@ -114,5 +130,9 @@ mod tests {
         let one = render_one(&rec(2, false));
         assert!(one.contains("## Codex(gpt-6.1-sol) — 실패") && one.contains("시간 초과") && one.contains("둘째"));
         assert_eq!(render_list(&[], 5), "기록이 없다.\n");
+        // 개행 없이 붙은 두 객체 + 정상 줄 + 깨진 줄
+        let a = serde_json::to_string(&rec(1, true)).unwrap(); let b = serde_json::to_string(&rec(2, true)).unwrap();
+        let parsed = parse_all(&format!("{a}{b}\n{a}\nbroken\n"));
+        assert_eq!(parsed.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 2, 1]);
     }
 }
