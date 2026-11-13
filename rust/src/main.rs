@@ -24,6 +24,7 @@ mod subagents;
 mod converge;
 mod room;
 mod sidebar;
+mod theme;
 mod pty;
 mod relay;
 mod trust;
@@ -69,6 +70,8 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("ctl") => std::process::exit(ctl::run(&args[1..])),
+        // `mai ask …` 는 `mai ctl ask …` 의 줄임이다. 칸 안에서 가장 자주 치는 명령이라 ctl 을 빼도 받는다.
+        Some("ask") => std::process::exit(ctl::run(&args)),
         Some("--selftest") => return selftest(),
         Some("--probe") => return probe(),
         Some("--complete") => {
@@ -1143,14 +1146,15 @@ mod tests {
         assert_eq!(a.sessions[0].title, "zsh");
     }
 
-    /// 새 칸의 이름은 그 OS 의 셸이다 — 윈도우 powershell, 그 밖은 zsh 등.
+    /// 새 칸의 이름은 셸 이름이다 — 설정에 `shell` 이 없으면 윈도우 powershell, 그 밖은 zsh 등.
     #[test]
     fn 새_칸의_이름은_셸_이름이다() {
         let mut a = app();
         on_hit(&mut a, Hit::AddSession);
         let s = a.sessions.last().expect("방금 붙인 칸");
         assert_eq!(s.title, pty::shell_name(), "칸 이름이 셸 이름이 아니다");
-        if cfg!(windows) {
+        // 설정으로 셸을 바꿨으면 이름도 그 셸이다. 기본 셸일 때만 OS 관례를 확인한다.
+        if cfg!(windows) && room::Config::load().shell.is_empty() {
             assert!(s.title.contains("powershell") || s.title.contains("pwsh") || s.title.contains("cmd"), "{}", s.title);
         }
     }

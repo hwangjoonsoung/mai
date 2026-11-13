@@ -76,7 +76,12 @@ impl PtySession {
 
         let codex_shim = if shell { CodexShim::for_shell()? } else { None };
         let mut cmd = CommandBuilder::new(exe);
-        if let Some(shim) = &codex_shim { cmd.env("PATH", shim.path()?); }
+        // PATH 앞에 붙일 디렉터리: 셸 칸의 codex 심, 그리고 제어 디렉터리(MAI_CTL_DIR).
+        // 제어 디렉터리에는 서버가 `mai` 런처를 둔다(ctl/server.rs) — 칸 안에서 `mai ctl ask` 가
+        // 설치 여부와 상관없이 한 단어로 잡히게 하기 위해서다.
+        let mut front: Vec<PathBuf> = codex_shim.iter().map(|s| s.0.clone()).collect();
+        if let Some((_, dir)) = env.iter().find(|(k, _)| *k == "MAI_CTL_DIR") { front.push(PathBuf::from(dir)); }
+        if !front.is_empty() { cmd.env("PATH", prepend_path(&front)?); }
         // Advertise the emulator we implement, not the outer terminal’s private protocols.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -325,10 +330,12 @@ impl CodexShim {
         Ok(shim)
     }
 
-    fn path(&self) -> Result<std::ffi::OsString> {
-        let inherited = std::env::var_os("PATH").unwrap_or_default();
-        Ok(std::env::join_paths(std::iter::once(self.0.clone()).chain(std::env::split_paths(&inherited)))?)
-    }
+}
+
+/// `dirs` 를 지금 PATH 앞에 붙인 값.
+fn prepend_path(dirs: &[PathBuf]) -> Result<std::ffi::OsString> {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    Ok(std::env::join_paths(dirs.iter().cloned().chain(std::env::split_paths(&inherited)))?)
 }
 
 impl Drop for CodexShim {
@@ -387,6 +394,123 @@ pub fn process_cwd(sys: &mut sysinfo::System, pid: u32) -> Option<PathBuf> {
     sys.process(pid).and_then(|p| p.cwd().map(PathBuf::from))
 }
 
+/// PowerShell 프롬프트(`PS <경로>>`)에서 지금 경로를 읽는다.
+///
+/// Windows PowerShell 의 `cd`(`Set-Location`)는 셸 안의 위치만 바꾸고 프로세스의
+/// cwd 는 그대로 둔다(실측: 5.1 에서 `cd ..` 뒤에도 `[Environment]::CurrentDirectory`
+/// 가 안 바뀐다). 그래서 [`process_cwd`] 만으로는 `cd` 를 따라갈 수 없다. 기본
+/// 프롬프트가 경로를 적어 주므로 커서가 놓인 줄에서 읽는다.
+///
+/// 남의 화면을 읽는 일이라 프롬프트를 바꿔 쓴 환경에서는 못 알아본다. 그때는
+/// None 을 주고 호출부가 예전 방식(프로세스 cwd)으로 떨어진다.
+pub fn prompt_cwd(screen: &vt100::Screen) -> Option<PathBuf> {
+    // 스크롤백을 보는 중이면 커서 줄이 화면의 그 줄이 아니다.
+    if screen.scrollback() != 0 {
+        return None;
+    }
+    let (row, _) = screen.cursor_position();
+    let (_, cols) = screen.size();
+    // 긴 경로는 다음 줄로 넘어간다. 이어진 윗줄까지 거슬러 올라가 한 줄로 잇는다.
+    let mut start = row;
+    while start > 0 && screen.row_wrapped(start - 1) {
+        start -= 1;
+    }
+    let line: String = (start..=row)
+        .map(|r| screen.contents_between(r, 0, r, cols))
+        .collect();
+    parse_ps_prompt(&line)
+}
+
+/// `PS C:\경로> 입력…` 에서 경로만 꺼낸다. 실제로 있는 디렉터리일 때만 준다.
+fn parse_ps_prompt(line: &str) -> Option<PathBuf> {
+    let rest = line.strip_prefix("PS ")?;
+    // `>` 는 Windows 경로에 쓸 수 없는 글자라 처음 나오는 것이 프롬프트의 끝이다.
+    let (path, _) = rest.split_once('>')?;
+    let p = PathBuf::from(path.trim_end());
+    (p.is_absolute() && p.is_dir()).then_some(p)
+}
+
+/// 셸 칸 안에서 지금 돌고 있는 에이전트를 찾는다. `shells` 와 같은 순서로 돌려준다.
+///
+/// 사용자는 셸 칸에서 `claude`·`codex`·`agy` 를 직접 친다. 우리가 띄운 것이
+/// 아니라 그 칸이 누구의 칸인지 알 길이 프로세스 트리뿐이다. 셸의 자손 가운데
+/// 실행 파일 이름이 에이전트인 것을 찾는다.
+///
+/// npm 으로 깐 CLI 는 `node` 로 뜬다. 그때는 이름만으로 알 수 없어 명령줄을 본다.
+/// 명령줄 조회는 비싸므로 그런 프로세스에 한해서만 한다.
+pub fn agents_under(sys: &mut sysinfo::System, shells: &[u32]) -> Vec<Option<&'static str>> {
+    use std::collections::HashMap;
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
+    let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
+    for (pid, p) in sys.processes() {
+        if let Some(parent) = p.parent() {
+            children.entry(parent).or_default().push(*pid);
+        }
+    }
+
+    // 1차 — 이름으로 찾는다. 못 찾은 칸은 `node` 자손을 모아 둔다.
+    let mut found: Vec<Option<&'static str>> = Vec::with_capacity(shells.len());
+    let mut nodes: Vec<Vec<Pid>> = Vec::with_capacity(shells.len());
+    for &shell in shells {
+        let mut hit = None;
+        let mut node = Vec::new();
+        // 깊이를 묶어 둔다. 에이전트가 띄운 도구들까지 끝없이 내려갈 이유가 없다.
+        let mut stack = vec![(Pid::from_u32(shell), 0u8)];
+        'walk: while let Some((pid, depth)) = stack.pop() {
+            if depth >= 4 {
+                continue;
+            }
+            for &c in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
+                let name = sys.process(c).map(|p| exe_stem(p.name())).unwrap_or_default();
+                if let Some(a) = agent_by_name(&name) {
+                    hit = Some(a);
+                    break 'walk;
+                }
+                if name == "node" {
+                    node.push(c);
+                }
+                stack.push((c, depth + 1));
+            }
+        }
+        found.push(hit);
+        nodes.push(node);
+    }
+
+    // 2차 — `node` 로 뜬 것은 명령줄에 적힌 스크립트 경로로 가른다.
+    for (slot, node) in found.iter_mut().zip(&nodes) {
+        if slot.is_some() || node.is_empty() {
+            continue;
+        }
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(node),
+            false,
+            ProcessRefreshKind::new().with_cmd(UpdateKind::OnlyIfNotSet),
+        );
+        *slot = node.iter().find_map(|&pid| {
+            let cmd = sys.process(pid)?.cmd();
+            cmd.iter().find_map(|arg| {
+                let arg = arg.to_string_lossy().to_lowercase();
+                ["claude", "codex"].into_iter().find(|a| arg.contains(*a))
+            })
+        });
+    }
+    found
+}
+
+/// 실행 파일 이름에서 확장자를 떼고 소문자로. `Claude.exe` -> `claude`.
+fn exe_stem(name: &std::ffi::OsStr) -> String {
+    std::path::Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+fn agent_by_name(stem: &str) -> Option<&'static str> {
+    ["claude", "codex", "agy"].into_iter().find(|a| *a == stem)
+}
+
 /// 휠 한 칸을 자식이 고른 인코딩으로 바꾼다.
 ///
 /// 휠은 버튼 64(위)/65(아래)로 보고하고 좌표는 1-기준이다. SGR 은 좌표에 상한이
@@ -416,10 +540,36 @@ pub fn encode_wheel(
 
 /// 사용자의 대화형 셸을 어떻게 띄울지 해석한다.
 ///
+/// 설정(`config.toml` 의 `shell`)에 경로가 있으면 그 셸을 쓴다. 없거나 경로가
+/// 틀리면 환경이 정해 준 셸로 떨어진다.
+pub fn resolve_shell() -> Option<(PathBuf, Vec<String>)> {
+    configured_shell(&crate::room::Config::load().shell).or_else(default_shell)
+}
+
+/// 설정에 적힌 셸. 비었거나 파일이 아니면 None — 호출부가 기본 셸로 떨어진다.
+///
+/// 이름이 아니라 **전체 경로**만 받는다. Windows 에서 `bash` 를 이름으로 찾으면
+/// Git Bash 가 아니라 WSL 의 `System32\bash.exe` 가 먼저 잡힐 수 있다.
+fn configured_shell(value: &str) -> Option<(PathBuf, Vec<String>)> {
+    if value.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(value);
+    if !p.is_file() {
+        return None;
+    }
+    // PowerShell 은 기본 셸일 때와 같은 인자를 준다. 그 밖의 셸은 인자 없이 띄운다.
+    let stem = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let args = if stem == "pwsh" || stem == "powershell" { vec!["-NoLogo".into()] } else { vec![] };
+    Some((p, args))
+}
+
+/// 환경이 정해 준 셸.
+///
 /// 에이전트와 달리 셸은 **환경이 정해 준다.** `$SHELL` 을 먼저 보고, 없으면
 /// 그 OS 의 관례적인 셸로 떨어진다. 인자는 주지 않는다 — PTY 에 붙은 셸은
 /// 그것만으로 대화형이고, rc 파일도 알아서 읽는다.
-pub fn resolve_shell() -> Option<(PathBuf, Vec<String>)> {
+fn default_shell() -> Option<(PathBuf, Vec<String>)> {
     if cfg!(windows) {
         // COMSPEC 은 cmd.exe 를 가리킨다. PowerShell 이 있으면 그쪽이 낫다.
         for name in ["pwsh", "powershell"] {

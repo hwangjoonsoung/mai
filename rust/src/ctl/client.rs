@@ -59,7 +59,7 @@ fn ask(args: &[String]) -> Result<String, Failure> {
     if response.ok { touch_verified(pane); }
     // 여러 대상 중 일부만 실패하면 합친 답은 stdout 으로 주고, 실패 목록은 stderr · 종료 코드 1.
     if response.ok { response.answer.ok_or((1, "응답에 답이 없다".into(), None)) }
-    else { Err((1, response.error.unwrap_or_else(|| "검증 실패".into()), response.answer)) }
+    else { Err((1, response.error.unwrap_or_else(|| "요청 실패".into()), response.answer)) }
 }
 
 /// `<MAI_CTL 디렉터리>/verified-<pane>` 의 mtime 을 지금으로. 실패해도 조용히.

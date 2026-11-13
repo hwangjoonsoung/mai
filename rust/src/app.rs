@@ -20,6 +20,7 @@
 use crate::{
     model::{Session, Space},
     pty::PtySession,
+    theme,
     vtscreen::VtScreen,
 };
 use ratatui::{
@@ -70,6 +71,10 @@ pub enum Hit {
 struct Ask {
     group: u64, verifier: u64, target: crate::ctl::Target, baseline: Option<String>,
     injected_at: Option<Instant>, deadline: Option<Instant>,
+    /// 넣은 글에서 공백을 뺀 것. 입력창에 그대로 남아 있는지 화면과 견준다.
+    sent: String,
+    /// 제출되지 않은 질문에 Enter 를 다시 보낸 횟수.
+    enter_retries: u8,
 }
 /// 한 번의 `mai ctl ask` — 대상이 여럿이면 답을 모아 한 번에 돌려준다.
 struct AskGroup {
@@ -129,6 +134,8 @@ pub struct App {
     last_area: Rect,
     /// 자식의 경로를 물어보는 창구. 필요할 때만 만든다.
     sys: Option<sysinfo::System>,
+    /// 셸 칸에서 도는 에이전트를 마지막으로 찾아본 시각.
+    agents_checked: Instant,
     /// 인용 전달 상자에 띄울 요약. 무엇을 어디서 몇 자 가져왔는지.
     relay_preview: Option<String>,
     /// 이름을 고치는 중인 칸.
@@ -180,6 +187,7 @@ impl App {
             agents_area: Rect::ZERO,
             last_area: Rect::ZERO,
             sys: None,
+            agents_checked: Instant::now(),
             rename_target: None,
             last_tab_click: None,
             relay_preview: None,
@@ -285,6 +293,7 @@ impl App {
     /// 셸에서 `claude` 를 치면 뜨고, 그 편이 인자·프로필을 그대로 쓸 수 있어
     /// 낫다. 그래서 상자를 없애고 **누르면 칸이 하나 더 생기는** 것으로 바꿨다.
     /// 셸은 환경이 정한다 — 윈도우는 PowerShell, 그 밖에서는 `$SHELL`(보통 zsh).
+    /// 설정의 `shell` 에 경로가 있으면 그 셸이 이긴다.
     pub fn spawn_terminal(&mut self, area: Rect) {
         let n = (self.visible().len() + 1).min(MAX_SPLIT);
         let (h, w) = pane_size(area, n);
@@ -386,15 +395,27 @@ impl App {
         }
         let Some(pid) = s.pty.as_ref().and_then(|p| p.pid()) else { return };
 
-        // 진단(--probe)과 **같은 경로**를 쓴다. 갈라 두면 진단은 통과하는데
-        // 앱은 안 되는 상황이 생긴다.
-        let sys = self.sys.get_or_insert_with(sysinfo::System::new);
-        let found = crate::pty::process_cwd(sys, pid);
+        // PowerShell 은 `cd` 해도 프로세스 cwd 가 안 바뀐다. 프롬프트에 적힌
+        // 경로가 있으면 그쪽을 믿고, 프롬프트가 안 보이면(에이전트가 화면을
+        // 차지한 동안) 마지막으로 읽은 값을 쓴다.
+        let from_prompt = s.pty.as_ref().and_then(|p| crate::pty::prompt_cwd(&p.screen()));
+        let shell_cwd = from_prompt.or_else(|| s.shell_cwd.clone());
+
+        // 그 밖의 셸은 프로세스 cwd 로 본다. 진단(--probe)과 **같은 경로**를
+        // 쓴다. 갈라 두면 진단은 통과하는데 앱은 안 되는 상황이 생긴다.
+        let found = match shell_cwd.clone() {
+            Some(p) => Some(p),
+            None => {
+                let sys = self.sys.get_or_insert_with(sysinfo::System::new);
+                crate::pty::process_cwd(sys, pid)
+            }
+        };
 
         let i = self.focus;
         if let Some(s) = self.sessions.get_mut(i) {
             s.cwd_at = Some(Instant::now());
             s.cwd = found.clone();
+            s.shell_cwd = shell_cwd;
         }
         let Some(cwd) = found else { return };
         if let Some(sp) = self.spaces.get_mut(self.active_space) {
@@ -404,9 +425,65 @@ impl App {
         }
     }
 
+    /// 셸 칸에서 사용자가 직접 띄운 에이전트를 알아본다.
+    ///
+    /// 칸은 전부 셸로 뜨고 에이전트는 사용자가 그 안에서 친다. 누구의 칸인지
+    /// 알아야 색 점을 맞게 칠하고 답 넘기기가 세션 기록을 찾을 수 있다.
+    /// 에이전트가 끝나면 다시 셸 칸으로 돌아간다. 우리가 직접 띄운 요청 칸은
+    /// 이미 누구인지 알고 있으므로 건드리지 않는다.
+    fn detect_agents(&mut self) {
+        // 프로세스 목록 전체를 훑는 일이라 자주 하지 않는다.
+        if self.agents_checked.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.agents_checked = Instant::now();
+        let targets: Vec<(usize, u32)> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_terminal)
+            .filter_map(|(i, s)| Some((i, s.pty.as_ref()?.pid()?)))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let pids: Vec<u32> = targets.iter().map(|t| t.1).collect();
+        let sys = self.sys.get_or_insert_with(sysinfo::System::new);
+        let found = crate::pty::agents_under(sys, &pids);
+        for ((i, _), agent) in targets.into_iter().zip(found) {
+            let id = agent.unwrap_or("");
+            let s = &mut self.sessions[i];
+            if s.agent_id == id {
+                continue;
+            }
+            s.agent_id = id.into();
+            // 사용자가 이름을 고치지 않은 칸은 지금 도는 에이전트의 이름을 쓴다.
+            // 에이전트가 끝나면 셸 이름으로 돌아간다. 같은 셸이 여럿일 때 붙인
+            // 번호(`powershell 2`)는 그대로 옮긴다.
+            if s.user_titled || s.shell_title.is_empty() {
+                continue;
+            }
+            s.title = if id.is_empty() {
+                s.shell_title.clone()
+            } else {
+                let name = crate::ctl::display(id);
+                let number = s
+                    .shell_title
+                    .rsplit_once(' ')
+                    .map(|(_, n)| n)
+                    .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+                match number {
+                    Some(n) => format!("{name} {n}"),
+                    None => name.to_string(),
+                }
+            };
+        }
+    }
+
     /// 살아 있는 세션의 출력을 먹이고, 준비된 세션에 프롬프트를 넣는다.
     pub fn tick(&mut self) {
         self.follow_cwd();
+        self.detect_agents();
         self.receive_asks();
         for s in self.sessions.iter_mut() {
             let before = s.pty.as_ref().map(|p| p.rx_bytes).unwrap_or(0);
@@ -577,6 +654,8 @@ impl App {
         if !name.is_empty() {
             if let Some(s) = self.sessions.get_mut(i) {
                 s.title = name.to_string();
+                // 직접 고친 이름은 에이전트가 바뀌어도 우리가 덮어쓰지 않는다.
+                s.user_titled = true;
                 self.status = format!("이름을 «{name}» 로 바꿨다");
             }
         }
@@ -785,18 +864,37 @@ impl App {
         let area = f.area();
         let vert = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(3), Constraint::Length(1)])
+            .constraints([Constraint::Length(2), Constraint::Min(3)])
             .split(area);
+
+        // 화면 전체를 한 바탕으로 깐다. 이 뒤에 그리는 것들은 색을 따로 주지
+        // 않으면 이 바탕과 글자색을 그대로 쓴다.
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme::bg()).fg(theme::fg())),
+            area,
+        );
 
         // 최상단은 첫 질문이 아니라 **현재 공간의 경로**다.
         // 질문은 각 에이전트 화면 안에 이미 남아 있고, 여기서 늘 필요한 정보는
         // 「지금 어디서 돌고 있는가」다.
         f.render_widget(
-            Paragraph::new(self.active_path().to_string_lossy().into_owned())
+            Paragraph::new(format!(" {}", self.active_path().to_string_lossy()))
                 .style(Style::default().add_modifier(Modifier::BOLD))
-                .block(Block::default().borders(Borders::BOTTOM)),
+                .block(
+                    Block::default()
+                        .borders(Borders::BOTTOM)
+                        .border_style(Style::default().fg(theme::line())),
+                ),
             vert[0],
         );
+        // 상단 바 오른쪽 끝에 앱 이름을 흐리게 둔다. 세 칸만 덮는다 — 줄 전체에
+        // 그리면 경로 글자까지 흐린 색이 된다.
+        if vert[0].width >= 4 {
+            f.render_widget(
+                Paragraph::new("mai").style(Style::default().fg(theme::dim())),
+                Rect { x: vert[0].right() - 4, width: 3, height: 1, ..vert[0] },
+            );
+        }
 
         let main = Layout::default()
             .direction(Direction::Horizontal)
@@ -804,23 +902,14 @@ impl App {
             .split(vert[1]);
         crate::sidebar::draw(f, main[0], self);
 
+        // 탭 줄과 칸들은 사이드바 구분선·화면 끝에서 한 칸씩 띄운다.
+        let content = Rect { x: main[1].x + 1, width: main[1].width.saturating_sub(2), ..main[1] };
         let right = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(3)])
-            .split(main[1]);
+            .split(content);
         self.draw_tabbar(f, right[0]);
         self.draw_bodies(f, right[1]);
-
-        let hint = if self.prefix {
-            "Ctrl+] 눌림 — f 답 넘기기 · t 터미널 · p 에이전트 · n 모두에게 묻기 · a Ctrl+A 를 자식에게 · q 종료 · 1..9 포커스"
-                .to_string()
-        } else {
-            self.status.clone()
-        };
-        f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
-            vert[2],
-        );
     }
 
     /// 탭 줄. 세션 칩들과 끝의 `+`.
@@ -839,9 +928,9 @@ impl App {
             let label = " 전체 ";
             let w = UnicodeWidthStr::width(label) as u16;
             let style = if self.show_all {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Black).bg(theme::focus()).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme::dim())
             };
             spans.push(Span::styled(label, style));
             spans.push(Span::raw(" "));
@@ -856,9 +945,9 @@ impl App {
             let label = format!(" {} ", s.title);
             let w = UnicodeWidthStr::width(label.as_str()) as u16;
             let style = if focused {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Black).bg(theme::focus()).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme::dim())
             };
             spans.push(Span::styled(label, style));
             spans.push(Span::raw(" "));
@@ -873,7 +962,7 @@ impl App {
         if x + 3 <= area.right() {
             spans.push(Span::styled(
                 "[+]",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::ok()).add_modifier(Modifier::BOLD),
             ));
             self.add_session_hit = Some(Rect { x, y: area.y, width: 3, height: 1 });
         }
@@ -885,7 +974,7 @@ impl App {
         if vis.is_empty() {
             f.render_widget(
                 Paragraph::new("이 공간에 세션이 없다. [+] 또는 Ctrl+] 다음 t 로 칸을 붙인다.")
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(theme::dim())),
                 area,
             );
             return;
@@ -901,26 +990,56 @@ impl App {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(vec![Constraint::Ratio(1, n as u32); n])
+            .spacing(1)
             .split(area);
 
         for (slot, &i) in shown.iter().enumerate() {
             let s = &self.sessions[i];
             let a = cols[slot];
             let focused = i == self.focus;
-            let border = if focused { Color::Cyan } else { Color::DarkGray };
+            let border = if focused { theme::focus() } else { theme::line() };
+            // 제목줄 — 누구의 칸인지 색 점과 이름으로 보인다. AI 가 `mai ctl ask` 로
+            // 연 칸은 요청받은 칸임을 덧붙인다(검증만이 아니라 여러 작업에 쓰인다).
+            let mut title = vec![
+                Span::styled(" ● ", Style::default().fg(theme::agent(&s.agent_id))),
+                Span::raw(format!("{} ", s.title)),
+            ];
+            if s.verifier_of.is_some() {
+                title.push(Span::styled("· 요청받음 ", Style::default().fg(theme::dim())));
+            } else if s.is_terminal
+                && !s.agent_id.is_empty()
+                && !s.title.contains(crate::ctl::display(&s.agent_id))
+            {
+                // 사용자가 이름을 고쳐 쓴 칸은 이름에 에이전트가 드러나지 않는다.
+                // 누가 돌고 있는지 덧붙인다.
+                title.push(Span::styled(
+                    format!("· {} ", crate::ctl::display(&s.agent_id)),
+                    Style::default().fg(theme::dim()),
+                ));
+            }
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(if focused { BorderType::Thick } else { BorderType::Plain })
-                .border_style(Style::default().fg(border))
-                .title(format!(" {} ", s.title));
-            let inner = block.inner(a);
+                .border_style(Style::default().fg(border));
+            let frame = block.inner(a);
             f.render_widget(block, a);
 
-            if a.width >= 6 {
-                let btn = Rect { x: a.right().saturating_sub(4), y: a.y, width: 3, height: 1 };
+            // 테두리 안쪽 첫 줄이 제목줄이고, 그 아래 구분선을 하나 긋는다.
+            // 나머지가 에이전트 화면이 그려지는 본문이다.
+            let head = Rect { height: frame.height.min(1), ..frame };
+            let rule = Rect { y: frame.y + 1, height: frame.height.saturating_sub(1).min(1), ..frame };
+            let inner = Rect { y: frame.y + 2, height: frame.height.saturating_sub(2), ..frame };
+            f.render_widget(Paragraph::new(Line::from(title)), head);
+            f.render_widget(
+                Paragraph::new("─".repeat(rule.width as usize))
+                    .style(Style::default().fg(theme::line())),
+                rule,
+            );
+
+            if head.width >= 6 && head.height > 0 {
+                let btn = Rect { x: head.right().saturating_sub(4), y: head.y, width: 3, height: 1 };
                 f.render_widget(
-                    Paragraph::new("[x]")
-                        .style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray })),
+                    Paragraph::new("[x]").style(Style::default().fg(theme::dim())),
                     btn,
                 );
                 self.close_hit.push((i, btn));
@@ -960,7 +1079,8 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Green))
+            .border_style(Style::default().fg(theme::focus()))
+            .style(Style::default().bg(theme::bg()).fg(theme::fg()))
             .title(title);
         let inner = block.inner(r);
         f.render_widget(block, r);
@@ -973,11 +1093,11 @@ impl App {
         // 받을 칸 — 켜진 것만 인용을 받는다.
         let mut spans: Vec<Span> = vec![Span::styled(
             "받을 칸  ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::dim()),
         )];
         for (i, (_, name, on)) in self.relay_targets.iter().enumerate() {
             let focused = self.relay_focus == i + 1;
-            let mut st = Style::default().fg(if *on { Color::Green } else { Color::DarkGray });
+            let mut st = Style::default().fg(if *on { theme::ok() } else { theme::dim() });
             if focused {
                 st = st.add_modifier(Modifier::REVERSED | Modifier::BOLD);
             }
@@ -993,14 +1113,14 @@ impl App {
         let on_input = self.relay_focus == 0;
         let mut spans: Vec<Span> = vec![Span::styled(
             "한 마디  ",
-            Style::default().fg(if on_input { Color::Cyan } else { Color::DarkGray }),
+            Style::default().fg(if on_input { theme::focus() } else { theme::dim() }),
         )];
         spans.push(Span::raw(self.input.as_str()));
         f.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
 
         f.render_widget(
             Paragraph::new("Tab 이동 · Space 켜기/끄기 · Enter 보내기 · Esc 취소")
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(theme::dim())),
             rows[2],
         );
 
@@ -1025,7 +1145,8 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Green))
+            .border_style(Style::default().fg(theme::focus()))
+            .style(Style::default().bg(theme::bg()).fg(theme::fg()))
             .title(title.to_string());
         let inner = block.inner(r);
         f.render_widget(block, r);
@@ -1224,16 +1345,32 @@ fn put_cursor(f: &mut Frame, inner: Rect, text: &str) {
 /// 패널 하나에 줄 PTY 크기. 테두리와 상하단 줄을 뺀 값이다.
 fn pane_size(area: Rect, n: usize) -> (u16, u16) {
     let n = n.max(1) as u16;
-    let usable = area.width.saturating_sub(crate::sidebar::WIDTH);
+    // 사이드바, 좌우 여백 2칸, 칸 사이 간격(n-1 칸)을 뺀 폭을 나눈다.
+    let usable = area.width.saturating_sub(crate::sidebar::WIDTH + 2 + (n - 1));
     let w = (usable / n).saturating_sub(2).max(20);
-    // 상단 경로 2줄 + 탭 1줄 + 상태 1줄 + 테두리 2줄
-    let h = area.height.saturating_sub(6).max(6);
+    // 상단 경로 2줄 + 탭 1줄 + 테두리 2줄 + 칸 제목줄과 구분선 2줄.
+    // 맨 아래 상태 줄은 없다.
+    let h = area.height.saturating_sub(7).max(6);
     (h, w)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 입력창에_남은_질문을_알아본다() {
+        let sent = squash("[powershell 의 요청]\n\"\"\"\n오늘 뉴스 10건을 가져와 줘.\n조건:\n- 서로 다른 토픽\n\"\"\"");
+        // 제출 안 됨 — 입력창 줄에 질문이 그대로. 화면에서는 줄바꿈이 사라져 붙어 보인다(실측).
+        let stuck = "codex\n\n› [powershell 의 요청]\"\"\"오늘 뉴스 10건을 가져와 줘.조건:- 서로\n  다른 토픽\"\"\"\n\n  Ready";
+        assert!(unsent_question(stuck, &sent));
+        // 제출됨 — 본문에 인용은 남지만 맨 아래 입력창은 비어 있다.
+        let working = "› [powershell 의 요청]\n\n• Working (3s • Esc to interrupt)\n\n›\n  ? for shortcuts";
+        assert!(!unsent_question(working, &sent));
+        // 안내문·빈 화면은 질문이 아니다.
+        assert!(!unsent_question("› Ask Codex to do anything", &sent));
+        assert!(!unsent_question("입력창이 없다", &sent));
+    }
 
     #[test]
     fn 틸데를_홈으로_바꾼다() {
@@ -1285,8 +1422,34 @@ mod tests {
     }
 }
 
+/// 공백을 전부 뺀다. 화면은 줄바꿈·들여쓰기가 제멋대로라 글자만 견준다.
+fn squash(text: &str) -> String { text.chars().filter(|c| !c.is_whitespace()).collect() }
+
+/// 넣은 질문이 아직 입력창에 남아 있는가.
+///
+/// 화면에서 **마지막** 입력창 줄(`›` codex · `❯`/`>` claude·agy)을 찾아, 그 뒤 글자가 넣은 글의
+/// 일부면 제출되지 않은 것이다. 제출된 뒤의 입력창은 비어 있거나 안내문이라 맞지 않는다.
+/// 마지막 줄만 보는 이유는 대화 본문에 인용된 질문이 그 위에 같은 글리프로 보일 수 있어서다.
+fn unsent_question(screen: &str, sent: &str) -> bool {
+    let Some(line) = screen.lines().rev().map(str::trim).find(|l| l.starts_with(&['›', '❯', '>'][..])) else { return false };
+    let glyph = line.chars().next().map_or(0, char::len_utf8);
+    let rest: String = squash(&line[glyph..]).chars().take(16).collect();
+    rest.chars().count() >= 6 && sent.contains(&rest)
+}
+
 impl App {
     pub fn by_id(&self, id: u64) -> Option<usize> { self.sessions.iter().position(|s| s.id == id) }
+
+    /// 이 칸이 검증자로서 답하는 중이면 그 요청이 시작된 시각. 사이드바가 쓴다.
+    pub fn verifying_since(&self, id: u64) -> Option<Instant> {
+        let ask = self.asks.iter().find(|a| a.verifier == id)?;
+        self.groups.iter().find(|g| g.id == ask.group).map(|g| g.started)
+    }
+
+    /// 이 칸이 낸 검증 요청이 아직 진행 중인가. 사이드바가 쓴다.
+    pub fn requesting(&self, id: u64) -> bool {
+        self.groups.iter().any(|g| g.requester == id)
+    }
     fn control_env(&self, id: u64, role: &str) -> Vec<(&'static str, std::ffi::OsString)> {
         let mut env = vec![("MAI_PANE", id.to_string().into()), ("MAI_ROLE", role.into())];
         crate::ctl::server::note_pane(id);
@@ -1344,7 +1507,7 @@ impl App {
     fn begin_ask(&mut self, req: crate::ctl::Request, stream: Box<dyn crate::ctl::transport::Conn>) -> Result<(), (Box<dyn crate::ctl::transport::Conn>, crate::ctl::Response)> {
         let fail = |stream, msg: &str| Err((stream, crate::ctl::Response::error(msg)));
         let Some(i) = self.by_id(req.pane) else { return fail(stream, "요청자 칸이 없다") };
-        if req.role == "verifier" || self.sessions[i].verifier_of.is_some() { return fail(stream, "검증자 칸에서는 다시 검증을 요청할 수 없다"); }
+        if req.role == "verifier" || self.sessions[i].verifier_of.is_some() { return fail(stream, "요청받은 칸에서는 다시 요청할 수 없다"); }
         if req.question.trim().is_empty() { return fail(stream, "잘못된 요청"); }
         let mut targets = req.targets();
         for t in &mut targets {
@@ -1364,16 +1527,19 @@ impl App {
         let cwd = self.sessions[i].cwd.clone().unwrap_or_else(|| self.spaces[self.sessions[i].space].path.clone());
         let title = self.sessions[i].title.clone(); let space = self.sessions[i].space;
         let group_id = self.next_id; self.next_id += 1;
+        // Windows 에서 표준 입력으로 온 질문은 CRLF 다. 붙여넣기 안의 CR 은 에이전트마다 다르게 읽으므로 LF 로 통일한다.
+        let question = req.question.replace("\r\n", "\n").replace('\r', "\n");
+        let body = format!("[{title} 의 요청]\n\"\"\"\n{question}\n\"\"\"");
         let mut asks = Vec::new();
         for target in &targets {
             let v = match self.verifier_pane(req.pane, target, &cwd, &title, space) { Ok(v) => v, Err(e) => { for a in asks { self.asks.push(a); } return Err((stream, crate::ctl::Response::error(e))) } };
             let baseline = crate::relay::last_answer_since(&target.agent, &cwd, self.sessions[v].spawned_at).map(|q| q.text);
-            self.sessions[v].pending = Some(format!("\x1b[200~[{title} 의 검증 요청]\n\"\"\"\n{}\n\"\"\"\x1b[201~", req.question));
+            self.sessions[v].pending = Some(format!("\x1b[200~{body}\x1b[201~"));
             self.sessions[v].user_typed = false;
-            asks.push(Ask { group: group_id, verifier: self.sessions[v].id, target: target.clone(), baseline, injected_at: None, deadline });
+            asks.push(Ask { group: group_id, verifier: self.sessions[v].id, target: target.clone(), baseline, injected_at: None, deadline, sent: squash(&body), enter_retries: 0 });
         }
         self.asks.extend(asks);
-        self.groups.push(AskGroup { id: group_id, requester: req.pane, targets, question: req.question.clone(), requester_title: title.clone(), cwd: cwd.clone(), keep: req.keep, started: Instant::now(), results: Vec::new(), waiters: vec![stream] });
+        self.groups.push(AskGroup { id: group_id, requester: req.pane, targets, question, requester_title: title.clone(), cwd: cwd.clone(), keep: req.keep, started: Instant::now(), results: Vec::new(), waiters: vec![stream] });
         Ok(())
     }
 
@@ -1404,29 +1570,40 @@ impl App {
         let asks = std::mem::take(&mut self.asks);
         for mut ask in asks {
             let requester_gone = self.groups.iter().find(|g| g.id == ask.group).map_or(true, |g| self.by_id(g.requester).is_none());
-            let result = if ask.deadline.is_some_and(|d| Instant::now() >= d) { Some(crate::ctl::Response::error("검증 시간 초과")) }
+            let result = if ask.deadline.is_some_and(|d| Instant::now() >= d) { Some(crate::ctl::Response::error("요청 시간 초과")) }
             else if requester_gone { Some(crate::ctl::Response::error("요청자 칸이 닫혔다")) }
             else if let Some(v) = self.by_id(ask.verifier) {
                 let s = &mut self.sessions[v];
-                if s.pty.as_ref().map_or(true, |p| p.finished()) { Some(crate::ctl::Response::error("검증자 칸이 종료됐다")) }
-                else if s.pending.is_some() { self.status = "검증 칸의 준비 또는 사용자 확인을 기다린다".into(); None }
+                if s.pty.as_ref().map_or(true, |p| p.finished()) { Some(crate::ctl::Response::error("요청받은 칸이 종료됐다")) }
+                else if s.pending.is_some() { self.status = "요청받은 칸의 준비 또는 사용자 확인을 기다린다".into(); None }
                 else {
                     let injected = ask.injected_at.get_or_insert_with(Instant::now);
                     let screen = s.pty.as_ref().unwrap().screen();
                     if injected.elapsed() < Duration::from_millis(2500) || s.seen.1.elapsed() < Duration::from_millis(2500) || crate::modal::open(&screen) { None }
                     else {
                         let quote = if ask.target.agent == "agy" { let mut q = crate::relay::from_screen(&screen); q.text = crate::relay::agy_answer(&q.text); Some(q) } else { crate::relay::last_answer_since(&ask.target.agent, s.cwd.as_ref().unwrap(), s.spawned_at) };
-                        quote.filter(|q| !q.text.trim().is_empty() && Some(&q.text) != ask.baseline.as_ref()).map(|q| crate::ctl::Response { ok: true, answer: Some(q.text), origin: Some(q.origin.label().into()), error: None })
+                        let answer = quote.filter(|q| !q.text.trim().is_empty() && Some(&q.text) != ask.baseline.as_ref()).map(|q| crate::ctl::Response { ok: true, answer: Some(q.text), origin: Some(q.origin.label().into()), error: None });
+                        if answer.is_some() { answer }
+                        // 답이 없는데 질문이 입력창에 그대로면 제출이 안 된 것이다(여러 줄 질문에서 실측 —
+                        // CTL_FIX_ENTER.md). Enter 를 다시 보내 보고, 그래도 안 되면 오류로 끝내
+                        // 요청자가 영원히 기다리지 않게 한다. 사람이 그 칸에 입력 중이면 손대지 않는다.
+                        else if s.user_typed || !unsent_question(&crate::relay::from_screen(&screen).text, &ask.sent) { None }
+                        else if ask.enter_retries < 2 {
+                            ask.enter_retries += 1; ask.injected_at = Some(Instant::now());
+                            if let Some(p) = s.pty.as_mut() { let _ = p.write(&[13]); }
+                            self.status = format!("요청받은 칸에 Enter 를 다시 보냈다 ({}/2)", ask.enter_retries); None
+                        }
+                        else { Some(crate::ctl::Response::error("질문이 전송되지 않았다 — 요청받은 칸에서 Enter 가 필요하다")) }
                     }
                 }
-            } else { Some(crate::ctl::Response::error("검증자 칸이 닫혔다")) };
+            } else { Some(crate::ctl::Response::error("요청받은 칸이 닫혔다")) };
             let Some(response) = result else { self.asks.push(ask); continue };
             let keep = self.groups.iter().find(|g| g.id == ask.group).is_some_and(|g| g.keep);
             if let Some(v) = self.by_id(ask.verifier) {
                 if !response.ok { self.sessions[v].pending = None; }
                 // 1회성 질문이면 답을 돌려준 뒤 검증 칸을 닫는다. 오류로 끝난 칸은
                 // 무슨 일이 있었는지 볼 수 있게 남긴다.
-                else if !keep { self.close_session(v); self.status = "검증 칸을 닫았다".into(); }
+                else if !keep { self.close_session(v); self.status = "요청받은 칸을 닫았다".into(); }
             }
             if let Some(g) = self.groups.iter_mut().find(|g| g.id == ask.group) { g.results.push((ask.target, response)); }
         }

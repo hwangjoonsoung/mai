@@ -66,8 +66,8 @@ impl<'a> Widget for VtScreen<'a> {
 
 fn style_of(cell: &vt100::Cell) -> Style {
     let mut s = Style::default()
-        .fg(convert(cell.fgcolor()))
-        .bg(convert(cell.bgcolor()));
+        .fg(convert(cell.fgcolor(), crate::theme::fg()))
+        .bg(convert(cell.bgcolor(), crate::theme::bg()));
     let mut m = Modifier::empty();
     if cell.bold() {
         m |= Modifier::BOLD;
@@ -87,9 +87,11 @@ fn style_of(cell: &vt100::Cell) -> Style {
     s
 }
 
-fn convert(c: vt100::Color) -> Color {
+/// 에이전트가 색을 지정하지 않은 칸(`Default`)은 우리 바탕·글자색으로 그린다.
+/// 그래야 칸 본문과 그 둘레가 한 바탕으로 이어진다.
+fn convert(c: vt100::Color, default: Color) -> Color {
     match c {
-        vt100::Color::Default => Color::Reset,
+        vt100::Color::Default => default,
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }

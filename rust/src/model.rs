@@ -52,18 +52,6 @@ pub enum State {
     Exited,
 }
 
-impl State {
-    pub fn color(self) -> ratatui::style::Color {
-        use ratatui::style::Color;
-        match self {
-            State::Starting => Color::Yellow,
-            State::Working => Color::Green,
-            State::Quiet => Color::Cyan,
-            State::Exited => Color::Red,
-        }
-    }
-}
-
 pub struct Session {
     pub id: u64,
     pub verifier_of: Option<u64>,
@@ -96,6 +84,16 @@ pub struct Session {
     /// 비싸므로 마지막으로 확인한 시각을 함께 둔다.
     pub cwd: Option<PathBuf>,
     pub cwd_at: Option<Instant>,
+    /// 프롬프트에서 마지막으로 읽은 경로 (PowerShell).
+    ///
+    /// PowerShell 의 `cd` 는 프로세스 cwd 를 바꾸지 않아 프롬프트에서 읽는다.
+    /// 그 칸에서 에이전트가 화면을 차지하면 프롬프트가 안 보이므로, 마지막으로
+    /// 읽은 값을 들고 있다가 쓴다.
+    pub shell_cwd: Option<PathBuf>,
+    /// 셸 칸으로 뜰 때 붙은 이름. 에이전트가 끝나면 이 이름으로 돌아간다.
+    pub shell_title: String,
+    /// 사용자가 이름을 직접 고쳤는가. 고친 칸의 이름은 우리가 바꾸지 않는다.
+    pub user_titled: bool,
     /// 에이전트가 아니라 사용자의 셸인가.
     ///
     /// 터미널 칸에는 서브에이전트 명부가 있을 리 없고, 화면을 훑어 봐야
@@ -122,6 +120,9 @@ impl Session {
             user_typed: false,
             cwd: None,
             cwd_at: None,
+            shell_cwd: None,
+            shell_title: String::new(),
+            user_titled: false,
             is_terminal: false,
         }
     }
@@ -130,6 +131,7 @@ impl Session {
     pub fn terminal(title: &str, space: usize) -> Self {
         let mut s = Self::new("", title, space);
         s.is_terminal = true;
+        s.shell_title = title.into();
         s
     }
 

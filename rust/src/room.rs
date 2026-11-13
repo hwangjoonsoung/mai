@@ -42,6 +42,8 @@ pub struct Config {
     pub ctl_model: std::collections::HashMap<String, String>,
     /// `mai ctl ask` 기록을 ~/.multi-ai-cli/ctl_history.jsonl 에 남긴다.
     pub ctl_history: bool,
+    /// 새 칸에 띄울 셸의 전체 경로. 비어 있으면 OS 기본 셸을 쓴다.
+    pub shell: String,
 }
 
 impl Default for Config {
@@ -52,6 +54,7 @@ impl Default for Config {
             ctl_timeout: 0,
             ctl_model: std::collections::HashMap::new(),
             ctl_history: true,
+            shell: String::new(),
         }
     }
 }
@@ -86,6 +89,7 @@ impl Config {
                 "ui_mode" if !v.is_empty() => c.ui_mode = v.into(),
                 "ctl_timeout" => c.ctl_timeout = v.parse().unwrap_or(0),
                 "ctl_history" => c.ctl_history = v != "false",
+                "shell" => c.shell = v.into(),
                 k if k.starts_with("ctl_model_") && !v.is_empty() => {
                     if let Some(agent) = crate::ctl::normalize(&k["ctl_model_".len()..]) { c.ctl_model.insert(agent.into(), v.into()); }
                 }
@@ -114,6 +118,11 @@ ctl_timeout = 0
 # ctl_model_agy = "gemini-3.8-flash-high"
 # 요청·답 기록(~/.multi-ai-cli/ctl_history.jsonl). `mai ctl history` 로 본다.
 ctl_history = true
+
+# 새 칸([+] · Ctrl+] t)에 띄울 셸. 실행 파일의 전체 경로를 적는다.
+# 비워 두면 OS 기본 셸이다 (Windows: PowerShell, 그 밖: $SHELL).
+# 경로가 틀리면 기본 셸로 뜬다. 역슬래시는 그대로 적는다.
+# shell = "C:\Program Files\Git\bin\bash.exe"
 "#;
 
 #[cfg(test)]
@@ -129,6 +138,9 @@ mod config_tests {
         let d = Config::parse(super::DEFAULT_CONFIG);
         assert_eq!(d.ctl_timeout, 0); assert!(d.ctl_model.is_empty()); assert!(d.ctl_history);
         assert!(!Config::parse("ctl_history = false").ctl_history); assert_eq!(d.agy_model, "gemini-3.1-pro-high");
+        // 셸 경로는 역슬래시와 공백을 그대로 둔다. 기본값은 비어 있다.
+        assert!(d.shell.is_empty());
+        assert_eq!(Config::parse(r#"shell = "C:\Program Files\Git\bin\bash.exe""#).shell, r"C:\Program Files\Git\bin\bash.exe");
     }
 }
 

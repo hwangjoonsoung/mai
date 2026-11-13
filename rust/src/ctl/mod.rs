@@ -68,7 +68,7 @@ pub fn parse_targets(spec: &str, default_model: Option<&str>) -> Option<Vec<Targ
 }
 
 /// 여러 대상의 답을 하나로 합친다. 대상이 하나면 그 답 그대로.
-/// 실패한 대상은 «검증하지 못했다» 로 표시하고 전체 ok 는 모두 성공일 때만.
+/// 실패한 대상은 «답을 받지 못했다» 로 표시하고 전체 ok 는 모두 성공일 때만.
 pub fn combine(results: &[(Target, Response)]) -> Response {
     if let [(_, r)] = results { return Response { ok: r.ok, answer: r.answer.clone(), origin: r.origin.clone(), error: r.error.clone() }; }
     let mut answer = String::new(); let mut failed = Vec::new();
@@ -78,7 +78,7 @@ pub fn combine(results: &[(Target, Response)]) -> Response {
         answer.push_str(&format!("## {label}\n"));
         match (&r.answer, &r.error) {
             (Some(a), _) if r.ok => answer.push_str(a),
-            (_, e) => { let e = e.clone().unwrap_or_else(|| "검증 실패".into()); answer.push_str(&format!("(검증하지 못했다: {e})")); failed.push(format!("{label}: {e}")); }
+            (_, e) => { let e = e.clone().unwrap_or_else(|| "요청 실패".into()); answer.push_str(&format!("(답을 받지 못했다: {e})")); failed.push(format!("{label}: {e}")); }
         }
     }
     Response { ok: failed.is_empty(), answer: Some(answer), origin: None, error: if failed.is_empty() { None } else { Some(failed.join(" · ")) } }
@@ -119,7 +119,7 @@ pub fn run(args: &[String]) -> i32 {
         assert!(one.ok); assert_eq!(one.answer.as_deref(), Some("2"));
         let many = combine(&[(t("codex", Some("sol")), Response::answer("2")), (t("claude", None), Response::error("시간 초과"))]);
         assert!(!many.ok);
-        assert_eq!(many.answer.as_deref(), Some("## Codex(sol)\n2\n\n## Claude\n(검증하지 못했다: 시간 초과)"));
+        assert_eq!(many.answer.as_deref(), Some("## Codex(sol)\n2\n\n## Claude\n(답을 받지 못했다: 시간 초과)"));
         assert_eq!(many.error.as_deref(), Some("Claude: 시간 초과"));
     }
 }

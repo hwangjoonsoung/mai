@@ -104,6 +104,7 @@ impl Server {
         sweep_stale(&temp);
         let dir = temp.join(format!("mai-{}", std::process::id()));
         make_private_dir(&dir)?;
+        write_launcher(&dir);
         let (listener, endpoint) = match bind(&dir) { Ok(x) => x, Err(e) => { let _ = std::fs::remove_dir_all(&dir); return Err(e); } };
         #[cfg(unix)]
         {
@@ -165,6 +166,25 @@ fn bind(dir: &std::path::Path) -> std::io::Result<(Listener, Endpoint)> {
     }
     let _ = dir;
     super::transport::bind_tcp()
+}
+
+/// 칸 안에서 `mai` 한 단어가 이 실행 파일로 잡히게 제어 디렉터리에 런처를 둔다.
+/// 칸의 PATH 앞에 이 디렉터리가 붙는다(pty.rs). 설치 심(`install.ps1`·`install.sh`)이 없어도
+/// 에이전트가 `mai ctl ask` 를 바로 칠 수 있어야 하기 때문이다 — 못 찾으면 실행 파일을
+/// 뒤지다 요청을 직접 수행해 버린 사례가 있었다. 실패해도 조용히 넘긴다.
+fn write_launcher(dir: &std::path::Path) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe = exe.to_string_lossy().into_owned();
+    // sh 용 — macOS·Linux 의 셸과, Windows 의 Git Bash(Claude Code 의 Bash 도구)가 쓴다.
+    let sh = dir.join("mai");
+    let quoted = exe.replace('\\', "/").replace('\'', "'\"'\"'");
+    if std::fs::write(&sh, format!("#!/bin/sh\nexec '{quoted}' \"$@\"\n")).is_ok() {
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o700)); }
+    }
+    // cmd·PowerShell 용.
+    #[cfg(windows)]
+    { let _ = std::fs::write(dir.join("mai.cmd"), format!("@echo off\r\n\"{exe}\" %*\r\n")); }
 }
 
 fn make_private_dir(dir: &std::path::Path) -> std::io::Result<()> {

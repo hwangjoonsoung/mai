@@ -148,34 +148,46 @@ fn codex_last(cwd: &Path, since: Option<std::time::SystemTime>) -> Option<String
         // **첫 줄만 읽어 거른다.** 전부 읽어 놓고 버리면 세션 기록 전체를
         // 훑게 된다 — 실측으로 358개 220MB 였다. 이건 키를 누른 순간 도는
         // 코드라 그 비용을 낼 수 없다.
-        if !created_since(&path, since) || !first_line_cwd_matches(&path, cwd) {
+        if !created_since(&path, since) || !first_line_accepts(&path, cwd) {
             continue;
         }
         let Ok(text) = fs::read_to_string(&path) else { continue };
-
-        let mut last = None;
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
-                continue;
-            }
-            // `?` 를 쓰면 payload 없는 레코드 하나에 스캔 전체가 끝난다.
-            let Some(p) = v.get("payload") else { continue };
-            if p.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-                continue;
-            }
-            let joined = join_text(p.get("content"), "output_text", "text");
-            if !joined.trim().is_empty() {
-                last = Some(joined);
-            }
-        }
-        return last;
+        return codex_answer_in(&text);
     }
     None
 }
 
-/// 파일의 첫 줄(`session_meta`)이 이 cwd 를 가리키는가.
-fn first_line_cwd_matches(path: &Path, cwd: &Path) -> bool {
+/// 기록 본문에서 마지막 답. `phase` 가 `final_answer` 인 메시지를 우선한다.
+///
+/// codex 는 작업 도중 «서브에이전트가 검색 중이다» 같은 중간 보고를
+/// `phase: commentary` 로 남긴다. 그걸 답으로 집으면 안 된다. `phase` 가 없는
+/// 옛 기록은 마지막 assistant 메시지로 떨어진다.
+fn codex_answer_in(text: &str) -> Option<String> {
+    let (mut last_final, mut last_any) = (None, None);
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+            continue;
+        }
+        // `?` 를 쓰면 payload 없는 레코드 하나에 스캔 전체가 끝난다.
+        let Some(p) = v.get("payload") else { continue };
+        if p.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let joined = join_text(p.get("content"), "output_text", "text");
+        if joined.trim().is_empty() {
+            continue;
+        }
+        if p.get("phase").and_then(|s| s.as_str()) == Some("final_answer") {
+            last_final = Some(joined.clone());
+        }
+        last_any = Some(joined);
+    }
+    last_final.or(last_any)
+}
+
+/// 파일의 첫 줄(`session_meta`)이 이 cwd 의 **주 스레드**인가.
+fn first_line_accepts(path: &Path, cwd: &Path) -> bool {
     use std::io::{BufRead, BufReader};
     let Ok(f) = fs::File::open(path) else { return false };
     let mut line = String::new();
@@ -183,7 +195,20 @@ fn first_line_cwd_matches(path: &Path, cwd: &Path) -> bool {
         return false;
     }
     let Ok(meta) = serde_json::from_str::<serde_json::Value>(&line) else { return false };
-    meta.pointer("/payload/cwd").and_then(|c| c.as_str()).map(Path::new) == Some(cwd)
+    meta_accepts(&meta, cwd)
+}
+
+/// cwd 가 맞고 서브에이전트 기록이 아니어야 한다.
+///
+/// codex 서브에이전트는 같은 cwd 로 **자기 rollout 파일을 따로** 만든다
+/// (`source: {"subagent": {"thread_spawn": …}}` 와 `parent_thread_id`). 실측:
+/// 토픽 10개를 서브에이전트 10개에 맡기자 파일 11개가 생겼고, mtime 순으로 고르면
+/// 마지막 서브에이전트의 답(기사 1건)이 주 스레드의 답(10건)을 가렸다.
+/// Windows 는 열려 있는 파일의 mtime 을 바로 갱신하지 않아 순서로는 못 가른다.
+fn meta_accepts(meta: &serde_json::Value, cwd: &Path) -> bool {
+    let subagent = meta.pointer("/payload/source/subagent").is_some()
+        || meta.pointer("/payload/parent_thread_id").is_some_and(|p| !p.is_null());
+    !subagent && meta.pointer("/payload/cwd").and_then(|c| c.as_str()).map(Path::new) == Some(cwd)
 }
 
 // ---------- 공통 ----------
@@ -281,6 +306,27 @@ mod tests {
         assert!(out.contains("[Claude 의 답변]"));
         assert!(out.contains("넌 어떻게 생각해?"));
         assert!(out.contains("1줄\n2줄"), "줄바꿈이 살아 있어야 한다");
+    }
+
+    #[test]
+    fn codex_서브에이전트_기록은_거른다() {
+        let cwd = Path::new("/work");
+        let main: serde_json::Value = serde_json::from_str(r#"{"type":"session_meta","payload":{"cwd":"/work","source":"vscode"}}"#).unwrap();
+        let sub: serde_json::Value = serde_json::from_str(r#"{"type":"session_meta","payload":{"cwd":"/work","parent_thread_id":"p","source":{"subagent":{"thread_spawn":{"parent_thread_id":"p","depth":1}}}}}"#).unwrap();
+        let other: serde_json::Value = serde_json::from_str(r#"{"type":"session_meta","payload":{"cwd":"/else","source":"cli"}}"#).unwrap();
+        assert!(meta_accepts(&main, cwd));
+        assert!(!meta_accepts(&sub, cwd), "서브에이전트 rollout 은 주 스레드의 답이 아니다");
+        assert!(!meta_accepts(&other, cwd));
+    }
+
+    #[test]
+    fn codex_중간_보고보다_최종_답을_고른다() {
+        let line = |phase: &str, text: &str| format!(r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","phase":"{phase}","content":[{{"type":"output_text","text":"{text}"}}]}}}}"#);
+        let text = [line("commentary", "찾는 중"), line("final_answer", "답 10건"), line("commentary", "다음 턴 작업 중")].join("\n");
+        assert_eq!(codex_answer_in(&text).as_deref(), Some("답 10건"));
+        let old = r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"옛 기록"}]}}"#;
+        assert_eq!(codex_answer_in(old).as_deref(), Some("옛 기록"), "phase 가 없으면 마지막 메시지");
+        assert_eq!(codex_answer_in("{\"type\":\"turn_context\"}"), None);
     }
 
     #[test]
