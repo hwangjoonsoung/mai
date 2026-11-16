@@ -151,6 +151,14 @@ pub struct App {
     relay_targets: Vec<(usize, String, bool)>,
     /// 인용 상자의 포커스. 0 은 문장 입력, 1.. 은 n-1 번째 후보다.
     pub relay_focus: usize,
+    /// 새 공간 입력의 후보 디렉터리 이름. 입력이 바뀔 때마다 다시 센다.
+    ///
+    /// 예전엔 Tab 을 눌러야 후보를 상태줄에 적었는데, 상태줄은 화면에 그려지지
+    /// 않아 **어디로 갈 수 있는지 볼 방법이 없었다.** 이제 입력 상자 아래에
+    /// 늘 목록으로 보여준다.
+    pub space_candidates: Vec<String>,
+    /// 후보 목록에서 ↑↓ 로 고른 것. None 이면 아직 고르지 않았다.
+    pub space_pick: Option<usize>,
 }
 
 impl App {
@@ -197,6 +205,8 @@ impl App {
             rename_target: None,
             last_tab_click: None,
             relay_preview: None,
+            space_candidates: Vec::new(),
+            space_pick: None,
             relay_quote: None,
             relay_targets: Vec::new(),
             relay_focus: 0,
@@ -1229,9 +1239,89 @@ impl App {
         }
     }
 
-    /// 새 공간 경로 입력 상자.
+    /// 새 공간 경로 입력 상자 — 입력 줄 아래에 갈 수 있는 하위 폴더를 늘 보여준다.
+    ///
+    /// 상자 높이는 후보 수와 상관없이 고정이다. 타이핑할 때마다 상자가 위아래로
+    /// 들썩이면 읽기 어렵다.
     fn draw_new_space(&self, f: &mut Frame) {
-        self.draw_prompt_box(f, " 새 공간 경로 (Tab 완성 · Enter 추가 · Esc 취소) ");
+        let area = f.area();
+        let rows = SPACE_LIST_ROWS;
+        // 테두리 2 + 입력 1 + 구분선 1 + 목록 + 안내 1
+        let r = center(area, area.width.min(70), rows + 5);
+        f.render_widget(Clear, r);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::focus()))
+            .style(Style::default().bg(theme::bg()).fg(theme::fg()))
+            .title(" 새 공간 경로 ");
+        let inner = block.inner(r);
+        f.render_widget(block, r);
+
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        f.render_widget(Paragraph::new(self.input.as_str()), parts[0]);
+        f.render_widget(
+            Paragraph::new("─".repeat(parts[1].width as usize))
+                .style(Style::default().fg(theme::line())),
+            parts[1],
+        );
+
+        let list = parts[2];
+        let n = self.space_candidates.len();
+        if n == 0 {
+            f.render_widget(
+                Paragraph::new("  (일치하는 하위 폴더가 없다)")
+                    .style(Style::default().fg(theme::dim())),
+                list,
+            );
+        } else {
+            let visible = (list.height as usize).max(1);
+            let (start, end) = space_window(n, visible, self.space_pick);
+            let sep = std::path::MAIN_SEPARATOR;
+            let lines: Vec<Line> = (start..end)
+                .map(|i| {
+                    let name = &self.space_candidates[i];
+                    if self.space_pick == Some(i) {
+                        Line::from(Span::styled(
+                            format!("› {name}{sep}"),
+                            Style::default()
+                                .fg(theme::focus())
+                                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                        ))
+                    } else {
+                        Line::from(format!("  {name}{sep}"))
+                    }
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), list);
+        }
+
+        let count = if n == 0 {
+            String::new()
+        } else {
+            let visible = (list.height as usize).max(1);
+            let (start, end) = space_window(n, visible, self.space_pick);
+            if n > visible {
+                format!("{}–{} / {n}  ", start + 1, end)
+            } else {
+                format!("{n}개  ")
+            }
+        };
+        f.render_widget(
+            Paragraph::new(format!("{count}↑↓ 고르기 · Tab 완성 · Enter 추가 · Esc 취소"))
+                .style(Style::default().fg(theme::dim())),
+            parts[3],
+        );
+        put_cursor(f, parts[0], &self.input);
     }
 
     /// 한 줄 입력 상자. 제목만 다르고 나머지는 같다.
@@ -1253,40 +1343,24 @@ impl App {
 
     /// 새 공간 입력에서 Tab — 경로를 채운다.
     ///
-    /// 디렉터리만 후보로 둔다. 공간은 디렉터리이기 때문이다. 후보가 하나면
-    /// 끝까지 채우고 구분자를 붙인다. 여럿이면 **공통 접두사까지만** 채우고
-    /// 후보를 상태줄에 보여준다 — 셸과 같은 동작이다.
+    /// 목록에서 ↑↓ 로 고른 것이 있으면 **그것으로** 채운다. 없으면 셸처럼
+    /// 동작한다 — 후보가 하나면 끝까지 채우고 구분자를 붙이고, 여럿이면 공통
+    /// 접두사까지만 채운다. 어느 쪽이든 끝나면 새 위치의 후보를 다시 센다.
     pub fn complete_path(&mut self) {
-        // `~` 는 먼저 풀어둔다. 그래야 이후 조작이 실제 경로 위에서 이뤄진다.
-        let sep = std::path::MAIN_SEPARATOR;
-        let mut expanded = expand_tilde(&self.input).to_string_lossy().into_owned();
-        // 구분자로 끝났다면 「이 안을 보여달라」는 뜻이다. 확장하면서 사라지므로
-        // 되살린다. 안 그러면 `~/` 가 홈의 **이름**을 완성하려 든다.
-        if self.input.trim_end().ends_with(['/', '\\']) && !expanded.ends_with(sep) {
-            expanded.push(sep);
+        if self.accept_space_pick() {
+            return;
         }
-        let (dir, prefix) = match expanded.rfind(['/', '\\']) {
-            Some(i) => (expanded[..=i].to_string(), expanded[i + 1..].to_string()),
-            // 구분자가 없으면 현재 디렉터리에서 찾는다.
-            None => (format!(".{sep}"), expanded.clone()),
-        };
-
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            self.input = expanded;
+        let sep = std::path::MAIN_SEPARATOR;
+        let (dir, prefix) = split_dir_prefix(&self.input);
+        let Some(names) = list_dirs(&dir, &prefix) else {
             self.status = format!("읽을 수 없는 경로: {dir}");
+            self.refresh_space_candidates();
             return;
         };
-        let mut names: Vec<String> = rd
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| starts_with_ci(n, &prefix))
-            .collect();
-        names.sort_by_key(|a| a.to_lowercase());
 
         match names.len() {
+            // 채울 게 없으면 입력은 손대지 않는다.
             0 => {
-                self.input = expanded;
                 self.status = "일치하는 디렉터리가 없다".into();
             }
             1 => {
@@ -1304,6 +1378,44 @@ impl App {
                 );
             }
         }
+        self.refresh_space_candidates();
+    }
+
+    /// 지금 입력에 맞는 후보를 다시 센다. 고른 것은 풀린다.
+    pub fn refresh_space_candidates(&mut self) {
+        let (dir, prefix) = split_dir_prefix(&self.input);
+        self.space_candidates = list_dirs(&dir, &prefix).unwrap_or_default();
+        self.space_pick = None;
+    }
+
+    /// 후보 목록에서 위(-1)·아래(+1)로 옮긴다. 끝에서는 반대쪽으로 돈다.
+    pub fn move_space_pick(&mut self, delta: i32) {
+        let n = self.space_candidates.len();
+        if n == 0 {
+            self.space_pick = None;
+            return;
+        }
+        self.space_pick = Some(match self.space_pick {
+            None if delta >= 0 => 0,
+            None => n - 1,
+            Some(i) => (i as i32 + delta).rem_euclid(n as i32) as usize,
+        });
+    }
+
+    /// 고른 후보의 전체 경로.
+    pub fn picked_space_path(&self) -> Option<String> {
+        let name = self.space_candidates.get(self.space_pick?)?;
+        let (dir, _) = split_dir_prefix(&self.input);
+        Some(format!("{dir}{name}{}", std::path::MAIN_SEPARATOR))
+    }
+
+    /// 고른 후보로 입력을 채우고 그 안의 후보를 보여준다. 고른 게 없으면 false.
+    fn accept_space_pick(&mut self) -> bool {
+        let Some(path) = self.picked_space_path() else { return false };
+        self.input = path;
+        self.status = String::new();
+        self.refresh_space_candidates();
+        true
     }
 
     // 사이드바가 자기 영역과 클릭 대상을 등록한다.
@@ -1381,6 +1493,53 @@ pub fn home_var() -> Option<std::ffi::OsString> {
     } else {
         std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
     }
+}
+
+/// 새 공간 상자에 늘 보이는 후보 줄 수.
+const SPACE_LIST_ROWS: u16 = 8;
+
+/// 입력을 (찾아볼 디렉터리, 이름 접두사) 로 가른다.
+///
+/// `~` 는 먼저 푼다. 구분자로 끝났다면 「이 안을 보여달라」는 뜻인데, 확장하며
+/// 사라지므로 되살린다. 안 그러면 `~/` 가 홈의 **이름**을 완성하려 든다.
+/// 구분자가 없으면 현재 디렉터리에서 찾는다.
+fn split_dir_prefix(input: &str) -> (String, String) {
+    let sep = std::path::MAIN_SEPARATOR;
+    let mut expanded = expand_tilde(input).to_string_lossy().into_owned();
+    if input.trim_end().ends_with(['/', '\\']) && !expanded.ends_with(sep) {
+        expanded.push(sep);
+    }
+    match expanded.rfind(['/', '\\']) {
+        Some(i) => (expanded[..=i].to_string(), expanded[i + 1..].to_string()),
+        None => (format!(".{sep}"), expanded),
+    }
+}
+
+/// `dir` 안에서 `prefix` 로 시작하는 하위 디렉터리 이름 (대소문자 무시, 정렬).
+///
+/// 숨김 폴더(`.` 으로 시작)는 접두사도 `.` 으로 시작할 때만 넣는다 — 목록이
+/// `.cache`·`.npm` 따위로 가득 차면 정작 갈 곳이 안 보인다. 읽을 수 없으면 None.
+fn list_dirs(dir: &str, prefix: &str) -> Option<Vec<String>> {
+    let show_hidden = prefix.starts_with('.');
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| show_hidden || !n.starts_with('.'))
+        .filter(|n| starts_with_ci(n, prefix))
+        .collect();
+    names.sort_by_key(|a| a.to_lowercase());
+    Some(names)
+}
+
+/// 후보 n 개 중 화면에 보일 [start, end). 고른 것이 늘 보이게 따라 내려간다.
+fn space_window(n: usize, visible: usize, pick: Option<usize>) -> (usize, usize) {
+    let start = match pick {
+        Some(i) if i >= visible => i + 1 - visible,
+        _ => 0,
+    };
+    (start, (start + visible).min(n))
 }
 
 /// `prefix` 로 시작하는가 — 대소문자를 가리지 않고, **문자 단위**로 본다.
@@ -1506,6 +1665,60 @@ mod tests {
         app.add_space(".").expect("현재 디렉터리는 공간이 된다");
         let p = app.active_path().to_string_lossy().into_owned();
         assert!(!p.starts_with(r"\\?\"), "verbatim 이 남았다: {p}");
+    }
+
+    #[test]
+    fn 새_공간_후보가_보이고_고를_수_있다() {
+        let base = std::env::temp_dir().join(format!("mai_space_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["alpha", "Beta", "beta2", ".hidden"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        std::fs::write(base.join("file.txt"), "x").unwrap();
+        std::fs::create_dir_all(base.join("alpha").join("inner")).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let root = format!("{}{sep}", base.to_string_lossy());
+
+        let mut app = App::new();
+        app.input = root.clone();
+        app.refresh_space_candidates();
+        // 파일·숨김 폴더는 빠지고, 대소문자 무시 정렬이다.
+        assert_eq!(app.space_candidates, vec!["alpha", "Beta", "beta2"]);
+
+        // 접두사로 걸러진다.
+        app.input = format!("{root}b");
+        app.refresh_space_candidates();
+        assert_eq!(app.space_candidates, vec!["Beta", "beta2"]);
+
+        // `.` 을 치면 숨김 폴더도 보인다.
+        app.input = format!("{root}.");
+        app.refresh_space_candidates();
+        assert_eq!(app.space_candidates, vec![".hidden"]);
+
+        // ↑↓ 는 돌아가며 고른다.
+        app.input = root.clone();
+        app.refresh_space_candidates();
+        app.move_space_pick(-1);
+        assert_eq!(app.space_pick, Some(2));
+        app.move_space_pick(1);
+        assert_eq!(app.space_pick, Some(0));
+        assert_eq!(app.picked_space_path().unwrap(), format!("{root}alpha{sep}"));
+
+        // Tab 은 고른 것으로 채우고 그 안의 후보를 보여준다.
+        app.complete_path();
+        assert_eq!(app.input, format!("{root}alpha{sep}"));
+        assert_eq!(app.space_candidates, vec!["inner"]);
+        assert_eq!(app.space_pick, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn 후보_창은_고른_것을_따라간다() {
+        assert_eq!(space_window(3, 8, None), (0, 3));
+        assert_eq!(space_window(20, 8, Some(3)), (0, 8));
+        assert_eq!(space_window(20, 8, Some(8)), (1, 9));
+        assert_eq!(space_window(20, 8, Some(19)), (12, 20));
     }
 
     #[test]

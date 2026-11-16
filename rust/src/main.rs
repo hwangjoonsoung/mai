@@ -320,22 +320,33 @@ fn on_key_new_space(app: &mut App, k: KeyEvent) -> Result<()> {
             app.mode = Mode::Panes;
         }
         KeyCode::Enter => {
-            let path = app.input.trim().to_string();
+            // 목록에서 고른 게 있으면 그 폴더를, 없으면 입력한 경로를 추가한다.
+            let path = app
+                .picked_space_path()
+                .unwrap_or_else(|| app.input.trim().to_string());
             match app.add_space(&path) {
                 Ok(()) => {
                     app.input.clear();
+                    app.space_candidates.clear();
+                    app.space_pick = None;
                     app.status = app::HINT.into();
                 }
                 // 경로가 틀렸으면 입력을 지우지 않는다. 고쳐 쓰게 둔다.
                 Err(e) => app.status = e,
             }
         }
-        // 셸처럼 Tab 으로 경로를 채운다. 공간은 디렉터리라 후보도 디렉터리뿐이다.
+        // 셸처럼 Tab 으로 경로를 채운다. 목록에서 고른 게 있으면 그것으로 채운다.
         KeyCode::Tab => app.complete_path(),
+        KeyCode::Up => app.move_space_pick(-1),
+        KeyCode::Down => app.move_space_pick(1),
         KeyCode::Backspace => {
             app.input.pop();
+            app.refresh_space_candidates();
         }
-        KeyCode::Char(c) => app.input.push(c),
+        KeyCode::Char(c) => {
+            app.input.push(c);
+            app.refresh_space_candidates();
+        }
         _ => {}
     }
     Ok(())
@@ -597,8 +608,13 @@ fn on_hit(app: &mut App, hit: Hit) {
         }
         Hit::Space(i) => app.select_space(i),
         Hit::AddSpace => {
+            // 구분자로 끝내 둔다. 그래야 처음부터 지금 공간 **안의** 폴더가 목록에 보인다.
             app.input = app.active_path().to_string_lossy().into_owned();
+            if !app.input.ends_with(['/', '\\']) {
+                app.input.push(std::path::MAIN_SEPARATOR);
+            }
             app.mode = Mode::NewSpace;
+            app.refresh_space_candidates();
         }
         // [+] 는 묻지 않고 칸을 하나 더 붙인다. 무엇을 띄울지 고르던 상자는
         // 없앴다 — 에이전트도 그 칸에서 `claude` 를 치면 뜬다. Ctrl+] t 와 같다.
@@ -698,6 +714,9 @@ fn on_paste(app: &mut App, text: &str) -> Result<()> {
         if let Some(s) = app.sessions.get_mut(focus) { s.user_typed = true; }
     } else {
         app.input.push_str(text);
+        if matches!(app.mode, Mode::NewSpace) {
+            app.refresh_space_candidates();
+        }
     }
     Ok(())
 }
