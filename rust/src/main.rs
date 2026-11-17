@@ -219,6 +219,8 @@ fn main() -> Result<()> {
             let agent = args.get(1).cloned().unwrap_or_else(|| "claude".into());
             return with_terminal(|t| solo(t, &agent));
         }
+        // `mai <경로>` — 그 경로를 공간으로. 런처 스크립트 없이 배포 실행 파일을 직접 부를 때도 같게 동작한다.
+        Some(p) if std::path::Path::new(p).is_dir() => std::env::set_current_dir(p)?,
         _ => {}
     }
     with_terminal(run)

@@ -1,0 +1,55 @@
+# v* 태그를 push 하면 OS 별 실행 파일을 빌드해 GitHub Release 에 올린다.
+# 설치 스크립트(scripts/install-remote.*)는 «최신 Release» 에서 내려받는다.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: mai-windows-x64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: mai-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: mai-macos-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: mai-linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 툴체인
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: 빌드
+        working-directory: rust
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: 산출물 이름 맞추기
+        shell: bash
+        run: |
+          src="rust/target/${{ matrix.target }}/release/multi_ai_cli"
+          [ -f "$src.exe" ] && src="$src.exe"
+          cp "$src" "${{ matrix.asset }}"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}

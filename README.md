@@ -28,18 +28,27 @@ AI-1 이 계획을 세우고 AI-2 가 그걸 검증하고 AI-3 가 구현하는 
 
 ## 빠른 시작
 
-```bash
-# 1. 설치 (한 번만)
-./scripts/install.sh                     # macOS / Linux
-.\scripts\install.ps1 -AddToPath         # Windows
+**설치 — 한 줄, Rust 필요 없음.** 최신 Release 의 실행 파일을 내려받아 PATH 에 둔다. 업데이트도 같은 한 줄이다.
 
-# 2. 점검 — claude · codex · agy 중 설치·로그인된 것만 쓴다
-mai --doctor                             # Windows: mai -Doctor
-
-# 3. 작업할 프로젝트에서 띄운다
-cd ~/my/project
-mai
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/hwangjoonsoung/mai/main/scripts/install-remote.ps1 | iex
 ```
+
+```bash
+# macOS (Apple Silicon · Intel) / Linux x64
+curl -fsSL https://raw.githubusercontent.com/hwangjoonsoung/mai/main/scripts/install-remote.sh | sh
+```
+
+```bash
+# 작업할 프로젝트에서 띄운다
+cd ~/my/project
+mai                     # 또는 mai ~/other/project
+```
+
+> 이 설치에서는 플래그를 OS 와 상관없이 `mai --trust` · `mai --which` 처럼 쓴다.
+> `--doctor` 와 `-Trust` 같은 PowerShell 스위치는 소스 빌드(§2 · §3)에만 있다.
+> 브라우저로 Release 파일을 직접 받은 macOS 는 `xattr -d com.apple.quarantine <파일>` 을 한 번 한다.
 
 1. 셸 칸 하나로 시작한다. `[+]` (또는 `Ctrl+]` 다음 `t`) 로 칸을 늘리고, 각 칸에서 `claude` · `codex` · `agy` 를 직접 친다.
 2. 키는 포커스된 칸으로 간다. mai 조작은 `Ctrl+]` 를 누른 뒤 키 하나 — `1..9` 칸 이동 · `f` 답 넘기기 · `n` 모든 칸에 같은 질문 · `q` 종료.
