@@ -58,6 +58,11 @@ pub struct Session {
     /// 검증 칸을 띄울 때 넘긴 모델. 같은 요청자라도 모델이 다르면 다른 칸이다.
     pub model: Option<String>,
     pub spawned_at: Option<std::time::SystemTime>,
+    pub resume: Option<(String, Option<String>)>,
+    /// Waiting for a restored command to start; timeout begins only after injection.
+    pub resume_waiting: bool,
+    pub resume_injected: Option<Instant>,
+    pub resume_process: Option<(u32, u64)>,
     pub agent_id: String,
     pub title: String,
     /// 어느 공간에 속하는가 (spaces 인덱스)
@@ -108,6 +113,10 @@ impl Session {
             verifier_of: None,
             model: None,
             spawned_at: None,
+            resume: None,
+            resume_waiting: false,
+            resume_injected: None,
+            resume_process: None,
             agent_id: agent_id.into(),
             title: title.into(),
             space,

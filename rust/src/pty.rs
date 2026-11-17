@@ -437,8 +437,15 @@ fn parse_ps_prompt(line: &str) -> Option<PathBuf> {
 /// 실행 파일 이름이 에이전트인 것을 찾는다.
 ///
 /// npm 으로 깐 CLI 는 `node` 로 뜬다. 그때는 이름만으로 알 수 없어 명령줄을 본다.
-/// 명령줄 조회는 비싸므로 그런 프로세스에 한해서만 한다.
-pub fn agents_under(sys: &mut sysinfo::System, shells: &[u32]) -> Vec<Option<&'static str>> {
+/// 명령줄은 node 후보와 감지된 AI에 한해서 조회한다. 재개 ID 판별에도 쓴다.
+pub struct AgentProcess {
+    pub agent: &'static str,
+    pub pid: u32,
+    pub start: u64,
+    pub cmd: Vec<String>,
+}
+
+pub fn agents_under(sys: &mut sysinfo::System, shells: &[u32]) -> Vec<Option<AgentProcess>> {
     use std::collections::HashMap;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
@@ -451,7 +458,7 @@ pub fn agents_under(sys: &mut sysinfo::System, shells: &[u32]) -> Vec<Option<&'s
     }
 
     // 1차 — 이름으로 찾는다. 못 찾은 칸은 `node` 자손을 모아 둔다.
-    let mut found: Vec<Option<&'static str>> = Vec::with_capacity(shells.len());
+    let mut found: Vec<Option<(&'static str, Pid)>> = Vec::with_capacity(shells.len());
     let mut nodes: Vec<Vec<Pid>> = Vec::with_capacity(shells.len());
     for &shell in shells {
         let mut hit = None;
@@ -465,7 +472,7 @@ pub fn agents_under(sys: &mut sysinfo::System, shells: &[u32]) -> Vec<Option<&'s
             for &c in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
                 let name = sys.process(c).map(|p| exe_stem(p.name())).unwrap_or_default();
                 if let Some(a) = agent_by_name(&name) {
-                    hit = Some(a);
+                    hit = Some((a, c));
                     break 'walk;
                 }
                 if name == "node" {
@@ -492,11 +499,21 @@ pub fn agents_under(sys: &mut sysinfo::System, shells: &[u32]) -> Vec<Option<&'s
             let cmd = sys.process(pid)?.cmd();
             cmd.iter().find_map(|arg| {
                 let arg = arg.to_string_lossy().to_lowercase();
-                ["claude", "codex"].into_iter().find(|a| arg.contains(*a))
+                ["claude", "codex", "agy"].into_iter().find(|a| arg.contains(*a)).map(|a| (a, pid))
             })
         });
     }
-    found
+    let detected: Vec<Pid> = found.iter().flatten().map(|(_, pid)| *pid).collect();
+    if !detected.is_empty() {
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&detected), false,
+            ProcessRefreshKind::new().with_cmd(UpdateKind::OnlyIfNotSet));
+    }
+    found.into_iter().map(|hit| {
+        let (agent, pid) = hit?;
+        let p = sys.process(pid)?;
+        Some(AgentProcess { agent, pid: pid.as_u32(), start: p.start_time(),
+            cmd: p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect() })
+    }).collect()
 }
 
 /// 실행 파일 이름에서 확장자를 떼고 소문자로. `Claude.exe` -> `claude`.

@@ -20,6 +20,7 @@ mod selection;
 mod terminal_input;
 mod modal;
 mod model;
+mod layout;
 mod subagents;
 mod converge;
 mod room;

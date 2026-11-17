@@ -136,6 +136,9 @@ pub struct App {
     sys: Option<sysinfo::System>,
     /// 셸 칸에서 도는 에이전트를 마지막으로 찾아본 시각.
     agents_checked: Instant,
+    layout_store: Option<crate::layout::Store>,
+    saved_layout: Option<crate::layout::Layout>,
+    layout_checked: Instant,
     /// 인용 전달 상자에 띄울 요약. 무엇을 어디서 몇 자 가져왔는지.
     relay_preview: Option<String>,
     /// 이름을 고치는 중인 칸.
@@ -188,6 +191,9 @@ impl App {
             last_area: Rect::ZERO,
             sys: None,
             agents_checked: Instant::now(),
+            layout_store: None,
+            saved_layout: None,
+            layout_checked: Instant::now(),
             rename_target: None,
             last_tab_click: None,
             relay_preview: None,
@@ -228,25 +234,61 @@ impl App {
 
     // ---------- 기동 ----------
 
-    /// 기동 직후 **터미널 하나만** 띄운다.
-    ///
-    /// 예전엔 쓸 수 있는 에이전트를 전부 자동으로 올렸다. 그런데 늘 셋 다
-    /// 필요한 것은 아니고, 안 쓸 참여자까지 켜 두면 칸이 좁아지고 각자 로그인·
-    /// 업데이트 안내를 띄워 정리부터 해야 했다. 지금은 **빈 작업대에서 시작해
-    /// 필요한 것만 사용자가 붙인다** — `[+]` 가 그 자리다.
-    ///
-    /// 터미널을 기본으로 두는 이유는, 무엇을 붙일지 정하기 전에도 그 경로에서
-    /// 뭔가는 해 보게 되기 때문이다.
+    /// 저장된 공간과 셸 칸을 복원하고 AI 재개 명령을 대기시킨다.
+    /// 저장이 없거나 잠금을 얻지 못했으면 현재 경로에 셸 하나로 시작한다.
     pub fn bootstrap(&mut self, area: Rect) {
         self.config = crate::room::Config::load();
         crate::ctl::models::warm_agy_cache();
         if self.ctl.is_none() {
             match crate::ctl::server::Server::start() { Ok(server) => self.ctl = Some(server), Err(e) => self.status = format!("제어 소켓 기동 실패: {e}") }
         }
-        self.spawn_terminal(area);
+        let launch = self.active_path();
+        self.layout_store = crate::layout::Store::acquire(crate::room::home()).ok();
+        let saved = self.layout_store.as_ref().and_then(|store| store.load());
+        if let Some(saved) = saved {
+            self.spaces.clear();
+            let mut mapping = vec![None; saved.spaces.len()];
+            for (old, space) in saved.spaces.iter().enumerate() {
+                if space.path.is_dir() {
+                    mapping[old] = Some(self.spaces.len());
+                    self.spaces.push(Space::new(space.path.clone()));
+                }
+            }
+            self.active_space = mapping.get(saved.active_space).copied().flatten().unwrap_or(0);
+            for pane in saved.panes {
+                let Some(space) = mapping.get(pane.space).copied().flatten() else { continue };
+                let cwd = if pane.cwd.is_dir() { pane.cwd } else { self.spaces[space].path.clone() };
+                let title = if pane.shell_title.is_empty() { crate::pty::shell_name() } else { pane.shell_title };
+                if let Some(i) = self.spawn_terminal_at(area, space, cwd, &title) {
+                    let s = &mut self.sessions[i];
+                    s.title = pane.title;
+                    s.user_titled = pane.user_titled;
+                    if let Some(agent) = pane.agent {
+                        if let Some(command) = crate::layout::resume_command(&agent, pane.session_id.as_deref()) {
+                            s.pending = Some(command);
+                            s.resume = Some((agent, pane.session_id));
+                            s.resume_waiting = true;
+                        }
+                    }
+                }
+            }
+            if let Some(i) = self.spaces.iter().position(|s| crate::layout::same_path(&s.path, &launch)) {
+                self.select_space(i);
+            } else {
+                self.spaces.push(Space::new(launch));
+                self.select_space(self.spaces.len() - 1);
+                self.spawn_terminal(area);
+            }
+        } else {
+            self.spawn_terminal(area);
+        }
         self.sync_sizes(area);
         self.focus = self.visible().first().copied().unwrap_or(0);
         self.status = HINT.into();
+        if self.layout_store.is_none() {
+            self.status = "구성 잠금을 얻지 못해 이번 실행은 복원·저장하지 않는다".into();
+        }
+        self.persist_layout(true);
     }
 
     // ---------- 공간 ----------
@@ -295,8 +337,6 @@ impl App {
     /// 셸은 환경이 정한다 — 윈도우는 PowerShell, 그 밖에서는 `$SHELL`(보통 zsh).
     /// 설정의 `shell` 에 경로가 있으면 그 셸이 이긴다.
     pub fn spawn_terminal(&mut self, area: Rect) {
-        let n = (self.visible().len() + 1).min(MAX_SPLIT);
-        let (h, w) = pane_size(area, n);
         let cwd = self.active_path();
 
         // 같은 공간에서 몇 번째 터미널인지 세어 이름을 붙인다.
@@ -311,7 +351,13 @@ impl App {
             format!("{} {}", crate::pty::shell_name(), used + 1)
         };
 
-        let mut sess = Session::terminal(&title, self.active_space);
+        self.spawn_terminal_at(area, self.active_space, cwd, &title);
+    }
+
+    fn spawn_terminal_at(&mut self, area: Rect, space: usize, cwd: PathBuf, title: &str) -> Option<usize> {
+        let n = (self.sessions.iter().filter(|s| s.space == space).count() + 1).min(MAX_SPLIT);
+        let (h, w) = pane_size(area, n);
+        let mut sess = Session::terminal(title, space);
         sess.id = self.next_id;
         self.next_id += 1;
         sess.cwd = Some(cwd.clone());
@@ -326,8 +372,9 @@ impl App {
                 self.focus = self.sessions.len() - 1;
                 self.mode = Mode::Panes;
                 self.status = format!("터미널 «{title}» 을 {} 에서 띄웠다", cwd.display());
+                Some(self.sessions.len() - 1)
             }
-            Err(e) => self.status = format!("터미널 기동 실패 — {e}"),
+            Err(e) => { self.status = format!("터미널 기동 실패 — {e}"); None }
         }
     }
 
@@ -450,9 +497,45 @@ impl App {
         let pids: Vec<u32> = targets.iter().map(|t| t.1).collect();
         let sys = self.sys.get_or_insert_with(sysinfo::System::new);
         let found = crate::pty::agents_under(sys, &pids);
+        let mut claimed: std::collections::HashSet<String> = self.sessions.iter()
+            .filter_map(|s| s.resume.as_ref()?.1.clone()).collect();
         for ((i, _), agent) in targets.into_iter().zip(found) {
-            let id = agent.unwrap_or("");
             let s = &mut self.sessions[i];
+            let id = agent.as_ref().map_or("", |a| a.agent);
+            if let Some(process) = &agent {
+                let same_process = s.resume_process == Some((process.pid, process.start));
+                let previous = s.resume.as_ref().filter(|r| r.0 == id)
+                    .and_then(|r| r.1.clone());
+                let mut excluded = claimed.clone();
+                if let Some(id) = &previous { excluded.remove(id); }
+                // Claude is an exact PID lookup. Other CLIs are best-effort file
+                // matching; reserve IDs already held by other panes.
+                let session_id = match id {
+                    "claude" => crate::layout::claude_session(process.pid),
+                    "codex" => {
+                        crate::layout::codex_session(&process.cmd, s.cwd.as_deref().unwrap_or(&self.spaces[s.space].path), process.start, &excluded)
+                    }
+                    "agy" => {
+                        crate::layout::agy_session(&process.cmd, process.start, &excluded)
+                    }
+                    _ => None,
+                }.or_else(|| if same_process || s.resume_waiting { previous } else { None });
+                if let Some(id) = &session_id { claimed.insert(id.clone()); }
+                s.resume = Some((id.into(), session_id));
+                s.resume_process = Some((process.pid, process.start));
+                if s.resume_waiting { s.pending = None; }
+                s.resume_waiting = false;
+                s.resume_injected = None;
+            } else if s.resume_waiting && !s.user_typed
+                && s.resume_injected.map_or(true, |t| t.elapsed() < Duration::from_secs(30)) {
+                continue;
+            } else {
+                if s.resume_waiting { s.pending = None; }
+                s.resume = None;
+                s.resume_process = None;
+                s.resume_waiting = false;
+                s.resume_injected = None;
+            }
             if s.agent_id == id {
                 continue;
             }
@@ -512,10 +595,24 @@ impl App {
                     // 에이전트에서 첫 글자가 잘린다.
                     std::thread::sleep(Duration::from_millis(120));
                     let _ = p.write(&[13]);
+                    if s.resume_waiting { s.resume_injected = Some(Instant::now()); }
                 }
             }
         }
         self.finish_asks();
+        self.persist_layout(self.quit);
+    }
+
+    fn persist_layout(&mut self, force: bool) {
+        let Some(store) = self.layout_store.as_ref() else { return };
+        if !force && self.layout_checked.elapsed() < Duration::from_secs(1) { return; }
+        self.layout_checked = Instant::now();
+        let layout = crate::layout::Layout::capture(&self.spaces, self.active_space, &self.sessions);
+        if self.saved_layout.as_ref() == Some(&layout) { return; }
+        match store.save(&layout) {
+            Ok(()) => self.saved_layout = Some(layout),
+            Err(e) => self.status = format!("구성 저장 실패: {e}"),
+        }
     }
 
     /// 화면 크기가 바뀌면 각 PTY 도 자기 칸 크기로 맞춘다.
