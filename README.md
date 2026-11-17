@@ -26,6 +26,30 @@ AI-1 이 계획을 세우고 AI-2 가 그걸 검증하고 AI-3 가 구현하는 
 
 ---
 
+## 빠른 시작
+
+```bash
+# 1. 설치 (한 번만)
+./scripts/install.sh                     # macOS / Linux
+.\scripts\install.ps1 -AddToPath         # Windows
+
+# 2. 점검 — claude · codex · agy 중 설치·로그인된 것만 쓴다
+mai --doctor                             # Windows: mai -Doctor
+
+# 3. 작업할 프로젝트에서 띄운다
+cd ~/my/project
+mai
+```
+
+1. 셸 칸 하나로 시작한다. `[+]` (또는 `Ctrl+]` 다음 `t`) 로 칸을 늘리고, 각 칸에서 `claude` · `codex` · `agy` 를 직접 친다.
+2. 키는 포커스된 칸으로 간다. mai 조작은 `Ctrl+]` 를 누른 뒤 키 하나 — `1..9` 칸 이동 · `f` 답 넘기기 · `n` 모든 칸에 같은 질문 · `q` 종료.
+3. 칸 안에서 다른 AI 에게 맡길 때는 `mai ask codex "이 구현을 검증해줘"` — 답이 stdout 으로 돌아온다 (→ [AI 사이 요청](#ai-사이-요청-mai-ctl-ask)).
+4. 처음 보는 폴더라 신뢰 대화상자가 뜨면 먼저 닫는다. 미리 `mai --trust` 로 등록해 둘 수 있다.
+
+자세한 키·설정은 §3 실행 · §4 조작법 · §7 설정.
+
+---
+
 ## 1. 무엇을 하는가
 
 ### 각 CLI 를 «그대로» 띄운다
