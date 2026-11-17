@@ -237,7 +237,15 @@ mod tests {
         let first = Store::acquire(dir.0.clone()).unwrap();
         assert!(Store::acquire(dir.0.clone()).is_err());
         drop(first);
-        assert!(Store::acquire(dir.0.clone()).is_ok());
+        // 다른 테스트가 PTY 자식을 fork 하면 exec 전까지 자식도 잠금 fd 를 잠깐 들고 있어
+        // 놓은 직후 한 번에 다시 잡지 못할 수 있다. 잠시 기다리며 다시 잡는다.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut again = Store::acquire(dir.0.clone());
+        while again.is_err() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            again = Store::acquire(dir.0.clone());
+        }
+        assert!(again.is_ok(), "잠금이 풀리지 않았다: {:?}", again.err());
     }
 
     #[test]
