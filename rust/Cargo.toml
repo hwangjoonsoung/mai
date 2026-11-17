@@ -1,6 +1,6 @@
 [package]
 name = "multi_ai_cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "Claude / Codex / Gemini(agy) 를 한 화면에서 다루는 에이전트 멀티플렉서"
