@@ -250,7 +250,11 @@ Codex 칸 위에서 휠을 위로 돌리면 지난 출력, 아래로 돌리면 �
 과거 출력에서도 드래그 선택·자동 복사를 사용할 수 있다.
 
 macOS/Linux의 MAI 셸에서 `codex`, `codex resume`를 입력하면 세션 전용 실행 래퍼가
-인라인 모드(`--no-alt-screen`)를 붙인다.
+인라인 모드(`--no-alt-screen`)를 붙인다. 이 옵션을 지원하는 Codex(0.169 이상)에는
+`--no-daemon`도 붙인다. 그러지 않으면 Codex가 명령을 공용 백그라운드 서버에서 실행해,
+처음 그 서버를 띄운 칸(이미 끝난 mai일 수 있다)의 `MAI_CTL`·`MAI_PANE`·`PATH`가 쓰이고
+Codex 칸에서 `mai ctl ask`가 «command not found»나 «No such file or directory»로 실패한다.
+직접 `--no-daemon`이나 `--remote`를 준 실행에는 붙이지 않는다. 검증 칸으로 띄우는 Codex도 같다.
 시스템 PATH와 셸 설정 파일은 바꾸지 않으며 래퍼는 세션 종료 때 삭제한다.
 직접 지정한 절대 실행파일 경로, 사용자 alias/function 또는 PATH 재설정이 래퍼를 우회하면
 그 실행의 화면 모드를 따른다. Windows 셸 직접 실행에는 이 래퍼를 적용하지 않는다.

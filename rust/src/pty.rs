@@ -303,7 +303,7 @@ impl CodexShim {
     #[cfg(unix)]
     fn for_shell() -> Result<Option<Self>> {
         match resolve_codex() {
-            Some((exe, args)) => Self::new(&exe, &args).map(Some),
+            Some((exe, args)) => { let flags = codex_flags(&exe, &args); Self::new(&exe, &args, &flags).map(Some) }
             None => Ok(None),
         }
     }
@@ -311,8 +311,10 @@ impl CodexShim {
     #[cfg(not(unix))]
     fn for_shell() -> Result<Option<Self>> { Ok(None) }
 
+    /// `flags` 는 사용자가 같은 플래그를 직접 주지 않았을 때만 앞에 붙인다.
+    /// `--remote` 로 원격 서버에 붙겠다는 명령에는 `--no-daemon` 을 붙이지 않는다.
     #[cfg(unix)]
-    fn new(exe: &std::path::Path, args: &[String]) -> Result<Self> {
+    fn new(exe: &std::path::Path, args: &[String], flags: &[&str]) -> Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -323,13 +325,64 @@ impl CodexShim {
         let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
         let command = std::iter::once(exe.to_string_lossy().into_owned()).chain(args.iter().cloned())
             .map(|arg| quote(&arg)).collect::<Vec<_>>().join(" ");
-        let script = format!("#!/bin/sh\nfor arg do\n  if [ \"$arg\" = --no-alt-screen ]; then exec {command} \"$@\"; fi\ndone\nexec {command} --no-alt-screen \"$@\"\n");
+        // 플래그마다 변수 하나(f0, f1, …). 사용자가 이미 준 플래그는 비운다.
+        let mut script = String::from("#!/bin/sh\n");
+        for (i, flag) in flags.iter().enumerate() { script.push_str(&format!("f{i}={flag}\n")); }
+        script.push_str("for arg do\n  case \"$arg\" in\n");
+        for (i, flag) in flags.iter().enumerate() {
+            let also = if *flag == "--no-daemon" { "|--remote|--remote=*" } else { "" };
+            script.push_str(&format!("    {flag}{also}) f{i}= ;;\n"));
+        }
+        script.push_str("  esac\ndone\n");
+        // 뒤에서부터 "$@" 앞에 끼워 넣어 순서를 지킨다.
+        for i in (0..flags.len()).rev() { script.push_str(&format!("[ -n \"$f{i}\" ] && set -- \"$f{i}\" \"$@\"\n")); }
+        script.push_str(&format!("exec {command} \"$@\"\n"));
         let file = shim.0.join("codex");
         std::fs::write(&file, script)?;
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700))?;
         Ok(shim)
     }
 
+}
+
+/// mai 칸에서 codex 를 띄울 때 붙이는 플래그.
+///
+/// `--no-daemon`: codex 0.169 부터 TUI 는 명령을 **공용 백그라운드 서버**
+/// (`codex app-server --managed-daemon`)에서 실행한다. 그 서버는 처음 띄운 칸의
+/// 환경변수를 그대로 들고 계속 살아 있어서, 이후 칸의 codex 가 실행하는 명령에는
+/// 엉뚱한(또는 이미 사라진 mai 의) `MAI_CTL`·`MAI_PANE` 과 `mai` 런처가 빠진
+/// `PATH` 가 들어간다. 그러면 codex 칸에서 `mai ctl ask` 가 «command not found»
+/// 나 «No such file or directory» 로 실패한다. 칸마다 자기 환경에서 명령을
+/// 실행하도록 공용 서버를 쓰지 않게 한다. 옵션이 없는 옛 codex 에는 붙이지 않는다.
+fn codex_flags(exe: &std::path::Path, args: &[String]) -> Vec<&'static str> {
+    static NO_DAEMON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_daemon = *NO_DAEMON.get_or_init(|| codex_supports(exe, args, "--no-daemon"));
+    let mut flags = vec!["--no-alt-screen"];
+    if no_daemon { flags.push("--no-daemon"); }
+    flags
+}
+
+/// `codex --help` 에 `flag` 가 있는가. 5초 안에 답이 없으면 없는 것으로 본다.
+fn codex_supports(exe: &std::path::Path, args: &[String], flag: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut child) = std::process::Command::new(exe).args(args).arg("--help")
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn() else { return false };
+    let Some(mut stdout) = child.stdout.take() else { let _ = child.kill(); let _ = child.wait(); return false };
+    let reader = std::thread::spawn(move || { let mut s = String::new(); let _ = stdout.read_to_string(&mut s); s });
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < std::time::Duration::from_secs(5) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => { let _ = child.kill(); let _ = child.wait(); return false; }
+        }
+    }
+    help_mentions(&reader.join().unwrap_or_default(), flag)
+}
+
+/// 도움말에 그 플래그가 옵션으로 있는가(`--no-daemon-x` 같은 다른 옵션은 아니다).
+fn help_mentions(help: &str, flag: &str) -> bool {
+    help.split(|c: char| c.is_whitespace() || c == ',' || c == '=' || c == '[' || c == ']').any(|w| w == flag)
 }
 
 /// `dirs` 를 지금 PATH 앞에 붙인 값.
@@ -361,7 +414,8 @@ pub fn resolve_agent(agent: &str) -> Option<(PathBuf, Vec<String>)> {
     }
     match agent {
         "codex" => resolve_codex().map(|(exe, mut args)| {
-            args.push("--no-alt-screen".into());
+            let flags = codex_flags(&exe, &args);
+            args.extend(flags.iter().map(|f| f.to_string()));
             (exe, args)
         }),
         // agy 는 macOS 에서 ~/.local/bin 에 설치되는 경우가 많다 (SPEC §8.4 K6).
@@ -874,16 +928,30 @@ mod terminal_regressions {
     }
 
     #[test]
+    fn 도움말에서_플래그를_통째로_찾는다() {
+        let help = "Options:\n      --no-daemon\n          Run without the shared background server\n      --no-alt-screen\n";
+        assert!(help_mentions(help, "--no-daemon"));
+        assert!(!help_mentions("      --no-daemon-x\n", "--no-daemon"));
+        assert!(!help_mentions("Options:\n  --remote <ADDR>\n", "--no-daemon"));
+    }
+
+    #[test]
     fn codex_shim_preserves_arguments_and_cleans_up() {
         let args = vec!["-c".into(), "printf '%s\\n' \"$@\"".into(), "arg0".into()];
-        let shim = CodexShim::new(std::path::Path::new("/bin/sh"), &args).unwrap();
+        let shim = CodexShim::new(std::path::Path::new("/bin/sh"), &args, &["--no-alt-screen", "--no-daemon"]).unwrap();
         let path = shim.0.clone();
-        for input in [vec!["a b", "한글", "a'b"], vec!["--no-alt-screen", "resume", "--last"]] {
-            let result = std::process::Command::new(path.join("codex")).args(&input).output().unwrap();
+        let cases: [(&[&str], &[&str]); 4] = [
+            (&["a b", "한글", "a'b"], &["--no-alt-screen", "--no-daemon", "a b", "한글", "a'b"]),
+            (&["--no-alt-screen", "resume", "--last"], &["--no-daemon", "--no-alt-screen", "resume", "--last"]),
+            (&["--no-daemon", "--no-alt-screen"], &["--no-daemon", "--no-alt-screen"]),
+            // 원격 서버에 붙는 명령에는 --no-daemon 을 붙이지 않는다.
+            (&["--remote", "ws://x"], &["--no-alt-screen", "--remote", "ws://x"]),
+        ];
+        for (input, expected) in cases {
+            let result = std::process::Command::new(path.join("codex")).args(input).output().unwrap();
             assert!(result.status.success());
             let output = String::from_utf8(result.stdout).unwrap();
-            let expected = if input[0] == "--no-alt-screen" { input.clone() } else { std::iter::once("--no-alt-screen").chain(input.iter().copied()).collect() };
-            assert_eq!(output.lines().collect::<Vec<_>>(), expected);
+            assert_eq!(output.lines().collect::<Vec<_>>(), expected, "input {input:?}");
         }
         drop(shim);
         assert!(!path.exists());
