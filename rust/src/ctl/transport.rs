@@ -68,10 +68,13 @@ pub enum Listener {
 }
 
 impl Listener {
+    /// 받은 연결은 블로킹으로 되돌린다. macOS·Windows 에서는 리스너의 논블로킹이
+    /// 받은 소켓에 그대로 물려져, 요청이 아직 도착하지 않았으면 읽기가 곧바로
+    /// WouldBlock 으로 끝나고 읽기 제한 시간(5초)도 듣지 않는다.
     pub fn accept(&self) -> std::io::Result<Box<dyn Conn>> {
         match self {
-            #[cfg(unix)] Listener::Unix(l) => { let (s, _) = l.accept()?; let _ = s.set_read_timeout(Some(Duration::from_secs(5))); Ok(Box::new(s)) }
-            Listener::Tcp(l) => { let (s, _) = l.accept()?; let _ = s.set_read_timeout(Some(Duration::from_secs(5))); Ok(Box::new(s)) }
+            #[cfg(unix)] Listener::Unix(l) => { let (s, _) = l.accept()?; s.set_nonblocking(false)?; let _ = s.set_read_timeout(Some(Duration::from_secs(5))); Ok(Box::new(s)) }
+            Listener::Tcp(l) => { let (s, _) = l.accept()?; s.set_nonblocking(false)?; let _ = s.set_read_timeout(Some(Duration::from_secs(5))); Ok(Box::new(s)) }
         }
     }
 }
@@ -112,15 +115,35 @@ mod tests {
         let a = random_token(); let b = random_token();
         assert_eq!(a.len(), 64); assert_ne!(a, b);
     }
+    /// 요청이 늦게 도착해도 받은 쪽은 기다렸다가 읽는다.
+    fn 늦게_온_요청도_읽는다(l: Listener, e: Endpoint) {
+        let mut c = e.connect().unwrap();
+        let mut s = None;
+        for _ in 0..200 { match l.accept() { Ok(x) => { s = Some(x); break } Err(_) => std::thread::sleep(Duration::from_millis(5)) } }
+        let mut s = s.expect("연결을 받지 못했다");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            c.write_all(b"ping\n").unwrap();
+        });
+        let mut buf = [0u8; 16];
+        let n = s.read(&mut buf).expect("받은 연결이 기다리지 않고 실패했다");
+        writer.join().unwrap();
+        assert_eq!(&buf[..n], b"ping\n");
+    }
     #[test]
     fn tcp_로_듣고_붙는다() {
         let (l, e) = bind_tcp().unwrap();
-        let mut c = e.connect().unwrap();
-        c.write_all(b"ping\n").unwrap();
-        let mut s = None;
-        for _ in 0..50 { match l.accept() { Ok(x) => { s = Some(x); break } Err(_) => std::thread::sleep(Duration::from_millis(10)) } }
-        let mut buf = String::new();
-        s.unwrap().read_to_string(&mut buf).ok();
-        assert!(buf.starts_with("ping"));
+        늦게_온_요청도_읽는다(l, e);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn 유닉스_소켓도_늦게_온_요청을_읽는다() {
+        let dir = std::env::temp_dir().join(format!("mai-ctl-t-{}-{}", std::process::id(), random_token().get(..8).unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        l.set_nonblocking(true).unwrap();
+        늦게_온_요청도_읽는다(Listener::Unix(l), Endpoint::Unix(path));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
