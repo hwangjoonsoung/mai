@@ -1080,6 +1080,48 @@ mod tests {
         assert!(!a.prefix, "프리픽스가 한 번 쓰고 풀려야 한다");
     }
 
+    #[cfg(unix)]
+    fn exiting_pane(title: &str) -> model::Session {
+        let mut s = model::Session::terminal(title, 0);
+        s.pty = Some(pty::PtySession::spawn_raw("/bin/sh", &["-c", "exit 0"], 5, 20).unwrap());
+        s
+    }
+
+    #[cfg(unix)]
+    fn tick_until(a: &mut App, done: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done(a) && std::time::Instant::now() < deadline {
+            a.tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 셸에서 `exit` 를 치면 그 칸만 닫힌다. 다른 칸이 남아 있으면 mai 는 계속 돈다.
+    #[cfg(unix)]
+    #[test]
+    fn 끝난_칸은_닫히고_남은_칸이_있으면_계속된다() {
+        let mut a = app();
+        let mut alive = model::Session::terminal("alive", 0);
+        alive.pty = Some(pty::PtySession::spawn_raw("/bin/sh", &["-c", "sleep 10"], 5, 20).unwrap());
+        a.sessions.push(alive);
+        a.sessions.push(exiting_pane("bye"));
+        tick_until(&mut a, |a| a.sessions.len() == 1);
+        assert_eq!(a.sessions.len(), 1, "끝난 칸이 닫히지 않았다");
+        assert_eq!(a.sessions[0].title, "alive");
+        assert!(!a.quit, "다른 칸이 남았는데 종료했다");
+    }
+
+    /// 마지막 칸이 끝나면 mai 를 끝내 바깥 셸로 돌아간다.
+    #[cfg(unix)]
+    #[test]
+    fn 마지막_칸이_끝나면_mai_를_끝낸다() {
+        let mut a = app();
+        a.sessions.push(exiting_pane("only"));
+        tick_until(&mut a, |a| a.quit);
+        assert!(a.sessions.is_empty());
+        assert!(a.quit, "마지막 칸이 끝났는데 mai 가 남았다");
+    }
+
     /// `[+]` 와 Ctrl+] t 는 터미널을 붙인다. 에이전트 선택 상자가 아니다.
     #[test]
     fn 프리픽스_t_는_터미널을_붙인다() {

@@ -610,6 +610,7 @@ impl App {
             }
         }
         self.finish_asks();
+        self.reap_exited();
         self.persist_layout(self.quit);
     }
 
@@ -622,6 +623,31 @@ impl App {
         match store.save(&layout) {
             Ok(()) => self.saved_layout = Some(layout),
             Err(e) => self.status = format!("구성 저장 실패: {e}"),
+        }
+    }
+
+    /// 프로세스가 끝난 칸을 닫는다. 칸이 하나도 안 남으면 mai 도 끝내고 바깥 셸로 돌아간다.
+    ///
+    /// 셸 칸에서 `exit` 를 치면 tmux 처럼 그 칸이 닫히고, 마지막 칸이었다면
+    /// mai 를 띄운 원래 셸로 돌아간다. 검증 칸은 오류를 볼 수 있게 남긴다
+    /// (finish_asks 가 이미 그렇게 다룬다).
+    fn reap_exited(&mut self) {
+        let mut closed = Vec::new();
+        for i in (0..self.sessions.len()).rev() {
+            let s = &self.sessions[i];
+            if s.verifier_of.is_some() || !s.pty.as_ref().is_some_and(|p| p.finished()) {
+                continue;
+            }
+            closed.push(s.title.clone());
+            self.close_session(i);
+        }
+        if closed.is_empty() {
+            return;
+        }
+        if self.sessions.is_empty() {
+            self.quit = true;
+        } else {
+            self.status = format!("종료된 칸을 닫았다: {}", closed.join(", "));
         }
     }
 
