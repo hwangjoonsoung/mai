@@ -284,6 +284,10 @@ impl App {
             }
             if let Some(i) = self.spaces.iter().position(|s| crate::layout::same_path(&s.path, &launch)) {
                 self.select_space(i);
+                // 마지막 칸에서 exit 해 칸 없이 저장됐을 수 있다. 실행한 공간이 비면 셸 하나를 띄운다.
+                if self.visible().is_empty() {
+                    self.spawn_terminal(area);
+                }
             } else {
                 self.spaces.push(Space::new(launch));
                 self.select_space(self.spaces.len() - 1);
@@ -429,8 +433,10 @@ impl App {
         }
     }
 
+    /// 포커스된 칸의 PTY. 보던 공간이 비어 포커스가 다른 공간 칸을 가리키면 없다.
     pub fn focused(&mut self) -> Option<&mut PtySession> {
-        self.sessions.get_mut(self.focus).and_then(|s| s.pty.as_mut())
+        let active = self.active_space;
+        self.sessions.get_mut(self.focus).filter(|s| s.space == active).and_then(|s| s.pty.as_mut())
     }
 
     /// 포커스된 터미널이 `cd` 했으면 공간을 그쪽으로 옮긴다.
@@ -443,7 +449,8 @@ impl App {
     /// 없다. 바뀌는 것은 «다음에 뜰 칸이 어디서 뜨는가» 와 화면에 적히는 경로다.
     fn follow_cwd(&mut self) {
         let Some(s) = self.sessions.get(self.focus) else { return };
-        if !s.is_terminal {
+        // 다른 공간의 칸이 이 공간 경로를 옮기면 안 된다(보던 공간이 비었을 때).
+        if !s.is_terminal || s.space != self.active_space {
             return;
         }
         // 초당 한 번이면 충분하다. 매 프레임 프로세스를 뒤지는 것은 낭비다.

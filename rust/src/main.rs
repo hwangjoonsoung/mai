@@ -1122,6 +1122,31 @@ mod tests {
         assert!(a.quit, "마지막 칸이 끝났는데 mai 가 남았다");
     }
 
+    /// 보던 공간의 칸이 다 닫혀도 다른 공간의 숨은 칸이 포커스를 넘겨받지 않는다.
+    /// 넘겨받으면 친 키가 안 보이는 칸으로 들어가고, 그 칸의 경로가 보던 공간
+    /// 경로를 덮어써 공간 두 개가 같은 경로가 된다.
+    #[cfg(unix)]
+    #[test]
+    fn 빈_공간에서는_다른_공간의_칸이_포커스를_받지_않는다() {
+        let mut a = app();
+        let other = std::env::temp_dir().canonicalize().unwrap();
+        a.spaces = vec![model::Space::new(other.clone()), model::Space::new(std::path::PathBuf::from("/"))];
+        let mut hidden = model::Session::terminal("hidden", 0);
+        hidden.pty = Some(pty::PtySession::spawn_raw("/bin/sh", &["-c", "cd \"$0\" && sleep 10", other.to_str().unwrap()], 5, 20).unwrap());
+        a.sessions.push(hidden);
+        a.sessions.push(exiting_pane("bye"));
+        a.sessions[1].space = 1;
+        a.active_space = 1;
+        a.focus = 1;
+        tick_until(&mut a, |a| a.sessions.len() == 1);
+        assert_eq!(a.sessions.len(), 1, "끝난 칸이 닫히지 않았다");
+        assert!(!a.quit, "다른 공간에 칸이 남았는데 종료했다");
+        assert!(a.focused().is_none(), "빈 공간에서 다른 공간의 칸이 포커스를 받았다");
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        while std::time::Instant::now() < deadline { a.tick(); std::thread::sleep(Duration::from_millis(50)); }
+        assert_ne!(a.spaces[1].path, a.spaces[0].path, "다른 공간 칸의 경로가 보던 공간 경로를 덮어썼다");
+    }
+
     /// `[+]` 와 Ctrl+] t 는 터미널을 붙인다. 에이전트 선택 상자가 아니다.
     #[test]
     fn 프리픽스_t_는_터미널을_붙인다() {
