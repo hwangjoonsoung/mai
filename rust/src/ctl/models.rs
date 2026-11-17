@@ -13,7 +13,7 @@ use std::time::Duration;
 /// TUI 용. 캐시만 본다.
 pub fn resolve(agent: &str, alias: &str) -> String {
     match agent {
-        "codex" => codex_cache_path().and_then(|p| std::fs::read_to_string(p).ok())
+        "codex" => codex_cache_path().and_then(|p| read_codex_cache(&p, &CODEX_LAST_GOOD, 3, Duration::from_millis(30)))
             .and_then(|json| resolve_codex(&json, alias)).unwrap_or_else(|| alias.to_string()),
         "agy" => std::fs::read_to_string(agy_cache_path()).ok()
             .and_then(|list| resolve_agy(&list, alias)).unwrap_or_else(|| alias.to_string()),
@@ -34,6 +34,30 @@ pub fn warm_agy_cache() {
 
 const AGY_CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
 const AGY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 마지막으로 온전히 읽은 `models_cache.json`.
+static CODEX_LAST_GOOD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `models_cache.json` 을 온전한 JSON 으로 읽는다.
+///
+/// codex(데스크톱 앱 · 공용 서버 · 칸마다 뜨는 TUI)는 이 파일을 몇 분마다
+/// **제자리에서**(같은 inode 로 비우고 다시 쓴다) 갱신한다. 그 사이에 읽으면 빈 파일이나
+/// 반쯤 쓴 JSON 이 나와 별칭을 못 풀고, `astra` 가 그대로 codex 로 넘어가
+/// «The 'astra' model is not supported…» 로 실패한다. 그래서 깨져 있으면 잠깐 쉬고
+/// 다시 읽고, 끝내 깨져 있으면 마지막으로 온전히 읽은 내용을 쓴다.
+fn read_codex_cache(path: &Path, last_good: &std::sync::Mutex<Option<String>>, tries: u32, wait: Duration) -> Option<String> {
+    for attempt in 0..tries {
+        if attempt > 0 { std::thread::sleep(wait); }
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let complete = serde_json::from_str::<serde_json::Value>(&text).ok()
+            .is_some_and(|v| v.get("models").is_some_and(|m| m.is_array()));
+        if complete {
+            if let Ok(mut g) = last_good.lock() { *g = Some(text.clone()); }
+            return Some(text);
+        }
+    }
+    last_good.lock().ok().and_then(|g| g.clone())
+}
 
 fn codex_cache_path() -> Option<PathBuf> {
     Some(Path::new(&crate::app::home_var()?).join(".codex").join("models_cache.json"))
@@ -157,6 +181,33 @@ mod tests {
         assert_eq!(resolve_agy(AGY, "gemini-3.8-flash-medium").as_deref(), Some("gemini-3.8-flash-medium"));
         assert_eq!(resolve_agy(AGY, "gem"), None);
         assert_eq!(resolve_agy("", "flash"), None);
+    }
+    #[test]
+    fn 갱신_중인_캐시는_다시_읽고_그래도_깨졌으면_마지막_온전한_내용을_쓴다() {
+        let dir = std::env::temp_dir().join(format!("mai-models-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("models_cache.json");
+        let last = std::sync::Mutex::new(None);
+        // 처음부터 깨져 있고 기억도 없으면 못 푼다.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(read_codex_cache(&path, &last, 2, Duration::from_millis(1)), None);
+        // 온전하면 그것을 쓰고 기억한다.
+        std::fs::write(&path, CACHE).unwrap();
+        let json = read_codex_cache(&path, &last, 2, Duration::from_millis(1)).unwrap();
+        assert_eq!(resolve_codex(&json, "astra").as_deref(), Some("gpt-6-astra"));
+        // codex 가 비우고 다시 쓰는 중(빈 파일 · 반쯤 쓴 JSON)이면 기억한 내용으로 푼다.
+        for partial in ["", &CACHE[..CACHE.len() / 2]] {
+            std::fs::write(&path, partial).unwrap();
+            let json = read_codex_cache(&path, &last, 2, Duration::from_millis(1)).unwrap();
+            assert_eq!(resolve_codex(&json, "astra").as_deref(), Some("gpt-6-astra"));
+        }
+        // 쓰는 도중 다시 읽으면 새 내용을 잡는다.
+        std::fs::write(&path, "{").unwrap();
+        let writer = { let path = path.clone(); std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(20)); std::fs::write(&path, r#"{"models":[{"slug":"gpt-7-astra","visibility":"list"}]}"#).unwrap(); }) };
+        let json = read_codex_cache(&path, &last, 50, Duration::from_millis(10)).unwrap();
+        writer.join().unwrap();
+        assert_eq!(resolve_codex(&json, "astra").as_deref(), Some("gpt-7-astra"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn 못_풀면_그대로_넘긴다() {
