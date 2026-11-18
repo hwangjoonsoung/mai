@@ -292,6 +292,7 @@ fn run(term: &mut Term) -> Result<()> {
                 if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
+                let k = fill_physical_shift(k);
                 match app.mode {
                     Mode::Panes => on_key_panes(&mut app, k)?,
                     Mode::NewSpace => on_key_new_space(&mut app, k)?,
@@ -677,6 +678,25 @@ fn keylog(k: &KeyEvent) {
         let _ = writeln!(f, "{:?} mods={:?} kind={:?}", k.code, k.modifiers, k.kind);
     }
 }
+
+/// Windows 에서 Enter 에 SHIFT 가 빠져 왔으면 실제 키보드 상태로 채운다.
+///
+/// Windows Terminal 은 SHIFT 를 콘솔 API 로 넘겨주지만, Shift+Enter 를
+/// CR 하나로만 보내는 터미널에서는 Enter 와 구분되지 않아 줄바꿈 대신
+/// 전송이 됐다. Enter 를 누른 순간에는 Shift 도 눌려 있으므로 그 상태를
+/// GetAsyncKeyState 로 직접 본다. ConPTY 안에서도 읽힌다(실측).
+#[cfg(windows)]
+fn fill_physical_shift(mut k: KeyEvent) -> KeyEvent {
+    #[link(name = "user32")]
+    extern "system" { fn GetAsyncKeyState(vkey: i32) -> i16; }
+    const VK_SHIFT: i32 = 0x10;
+    if k.code == KeyCode::Enter && !k.modifiers.contains(KeyModifiers::SHIFT) && unsafe { GetAsyncKeyState(VK_SHIFT) } < 0 {
+        k.modifiers |= KeyModifiers::SHIFT;
+    }
+    k
+}
+#[cfg(not(windows))]
+fn fill_physical_shift(k: KeyEvent) -> KeyEvent { k }
 
 /// Ctrl 과 함께 눌렸을 때 프리픽스로 볼 키인가.
 ///

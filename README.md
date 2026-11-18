@@ -240,7 +240,7 @@ application keypad, 선택 영역의 화면 밖 자동 스크롤은 지원하지
 | 터미널 | `Shift+Enter` | 대안 |
 |---|:---:|---|
 | iTerm2 · Ghostty · kitty · WezTerm | ✅ | |
-| Windows 콘솔 | ✅ 콘솔 API 가 SHIFT 를 직접 준다 | |
+| Windows (모든 터미널) | ✅ 콘솔 API 가 SHIFT 를 준다. 터미널이 CR 만 보내면 실제 Shift 키 상태를 본다 | |
 | **macOS 기본 Terminal.app** | ❌ 구분 불가 | `Option+Enter` (설정에서 「Option을 Meta 키로 사용」) |
 
 ### 5.2 Codex의 지난 출력은 휠로 탐색한다
