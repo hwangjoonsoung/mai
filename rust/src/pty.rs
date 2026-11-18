@@ -642,6 +642,10 @@ fn configured_shell(value: &str) -> Option<(PathBuf, Vec<String>)> {
 /// 그것만으로 대화형이고, rc 파일도 알아서 읽는다.
 fn default_shell() -> Option<(PathBuf, Vec<String>)> {
     if cfg!(windows) {
+        // Git Bash 에서 띄웠으면 칸도 그 bash 로 연다.
+        if let Some(bash) = git_bash() {
+            return Some((bash, vec![]));
+        }
         // COMSPEC 은 cmd.exe 를 가리킨다. PowerShell 이 있으면 그쪽이 낫다.
         for name in ["pwsh", "powershell"] {
             if let Some(p) = resolve(name) {
@@ -663,6 +667,24 @@ fn default_shell() -> Option<(PathBuf, Vec<String>)> {
         }
     }
     None
+}
+
+/// mai 를 Git Bash 에서 띄웠을 때 그 Git 의 bash.
+///
+/// Git Bash 는 `MSYSTEM` 과 `EXEPATH` 를 심어 둔다. `EXEPATH` 는 띄운 실행기에
+/// 따라 다르다 — git-bash.exe 창은 `<Git>`, `<Git>\bin\bash.exe` 는 `<Git>\bin`
+/// (실측). `$SHELL` 은 `/bin/bash.exe` 같은 MSYS 경로라 Windows 에서 그대로 열 수 없다.
+/// `<Git>\bin\bash.exe` 는 실행기라 `cd` 해도 그 프로세스 경로가 그대로여서
+/// 공간이 따라가지 못한다. 실제 bash 인 `<Git>\usr\bin\bash.exe` 를 쓴다(실측).
+fn git_bash() -> Option<PathBuf> {
+    std::env::var_os("MSYSTEM")?;
+    let exe_path = PathBuf::from(std::env::var_os("EXEPATH")?);
+    let bash = [Some(exe_path.as_path()), exe_path.parent()]
+        .into_iter()
+        .flatten()
+        .map(|git| git.join("usr").join("bin").join("bash.exe"))
+        .find(|bash| bash.is_file());
+    bash
 }
 
 /// 셸 실행 파일의 표시용 이름. `/bin/zsh` -> `zsh`.

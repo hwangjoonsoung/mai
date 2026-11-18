@@ -166,7 +166,8 @@ Windows 에서 앱 플래그를 **전부 스위치로 연** 것은, PowerShell �
 > 안내를 띄워 정리부터 해야 했다. 그래서 **빈 작업대에서 시작해 필요한 것만 붙이는** 쪽으로 잡았다.
 > 무엇을 띄울지 묻던 상자도 없앴다 — 고를 것이 결국 셸 하나였고, 에이전트는 그 셸에서
 > 평소 쓰던 인자·프로필 그대로 띄우는 편이 나았다. 새 칸의 셸은 환경이 정한다 —
-> Windows 는 PowerShell(`pwsh` → `powershell`), macOS·Linux 는 `$SHELL`(보통 `zsh`).
+> Windows 는 PowerShell(`pwsh` → `powershell`), 단 Git Bash 에서 띄웠으면 그 Git 의 bash
+> (`<Git>\usr\bin\bash.exe`)다. macOS·Linux 는 `$SHELL`(보통 `zsh`).
 > 다른 셸을 쓰려면 설정의 `shell` 에 경로를 적는다 (→ §7).
 
 | 키 | 동작 |

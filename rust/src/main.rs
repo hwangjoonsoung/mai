@@ -1264,7 +1264,7 @@ mod tests {
         assert_eq!(s.title, pty::shell_name(), "칸 이름이 셸 이름이 아니다");
         // 설정으로 셸을 바꿨으면 이름도 그 셸이다. 기본 셸일 때만 OS 관례를 확인한다.
         if cfg!(windows) && room::Config::load().shell.is_empty() {
-            assert!(s.title.contains("powershell") || s.title.contains("pwsh") || s.title.contains("cmd"), "{}", s.title);
+            assert!(s.title.contains("powershell") || s.title.contains("pwsh") || s.title.contains("cmd") || s.title.contains("bash"), "{}", s.title);
         }
     }
 

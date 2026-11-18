@@ -120,7 +120,7 @@ ctl_timeout = 0
 ctl_history = true
 
 # 새 칸([+] · Ctrl+] t)에 띄울 셸. 실행 파일의 전체 경로를 적는다.
-# 비워 두면 OS 기본 셸이다 (Windows: PowerShell, 그 밖: $SHELL).
+# 비워 두면 OS 기본 셸이다 (Windows: Git Bash 에서 띄웠으면 그 bash, 아니면 PowerShell. 그 밖: $SHELL).
 # 경로가 틀리면 기본 셸로 뜬다. 역슬래시는 그대로 적는다.
 # shell = "C:\Program Files\Git\bin\bash.exe"
 "#;
