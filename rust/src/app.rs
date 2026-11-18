@@ -636,9 +636,11 @@ impl App {
     /// 프로세스가 끝난 칸을 닫는다. 칸이 하나도 안 남으면 mai 도 끝내고 바깥 셸로 돌아간다.
     ///
     /// 셸 칸에서 `exit` 를 치면 tmux 처럼 그 칸이 닫히고, 마지막 칸이었다면
-    /// mai 를 띄운 원래 셸로 돌아간다. 검증 칸은 오류를 볼 수 있게 남긴다
+    /// mai 를 띄운 원래 셸로 돌아간다. 다른 공간에 칸이 남았으면 그 공간으로
+    /// 옮긴다. 검증 칸은 오류를 볼 수 있게 남긴다
     /// (finish_asks 가 이미 그렇게 다룬다).
     fn reap_exited(&mut self) {
+        let had_visible = !self.visible().is_empty();
         let mut closed = Vec::new();
         for i in (0..self.sessions.len()).rev() {
             let s = &self.sessions[i];
@@ -654,6 +656,10 @@ impl App {
         if self.sessions.is_empty() {
             self.quit = true;
         } else {
+            // 지금 공간의 마지막 칸이 닫혔으면 빈 화면에 두지 않고 칸이 남은 공간으로 옮긴다.
+            if had_visible && self.visible().is_empty() {
+                self.select_space(self.sessions[0].space);
+            }
             self.status = format!("종료된 칸을 닫았다: {}", closed.join(", "));
         }
     }
